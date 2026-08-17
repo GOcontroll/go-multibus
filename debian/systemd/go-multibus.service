@@ -1,6 +1,6 @@
 [Unit]
 Description=GOcontroll Multibus module service
-Documentation=file:/usr/share/doc/gocontroll/go-multibus.md
+Documentation=file:/usr/share/doc/go-multibus/go-multibus.md
 # The service resets the module itself, so it only needs the slot reset lines
 # and spidev to exist. It waits for USB on its own.
 After=systemd-udev-settle.service

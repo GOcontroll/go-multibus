@@ -1,6 +1,6 @@
 [Unit]
 Description=GOcontroll Multibus cell voltage publisher
-Documentation=file:/usr/share/doc/gocontroll/gocontroll-cellmon.md
+Documentation=file:/usr/share/doc/go-multibus/gocontroll-cellmon.md
 # The module is a USB device, so wait for udev to have settled the ttyACM nodes.
 After=systemd-udev-settle.service
 Wants=systemd-udev-settle.service

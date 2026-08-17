@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Zet de OTG-USB-poort van een GOcontroll Moduline-controller in host-modus.
+
+Waarom dit nodig is
+-------------------
+De poort `usb@32e40000` van de i.MX8 komt standaard op als USB-*device*
+(serieconsole-gadget).  Om er een USB-device aan te hangen -- zoals de
+Multibus-module -- moet hij host worden.
+
+`dr_mode = "otg"` met een runtime role-switch (`echo host > .../role`) is
+NIET voldoende: de chipidea-driver zet dan wel de controller om
+(`USBMODE.CM = 0b11`), maar initialiseert de PHY niet volledig voor
+host-modus.  Gevolg: de high-speed chirp faalt, alles valt terug naar
+full-speed en descriptor-transfers lopen stuk met `-71` (EPROTO).
+Herkenbaar in dmesg aan `new full-speed USB device` voor een device dat
+high-speed hoort te zijn.
+
+Alleen `dr_mode = "host"` geeft een volledige host-initialisatie.
+
+Wat dit script doet
+-------------------
+Afhankelijk van de bootmethode van het board (beide worden ondersteund en
+zo nodig allebei aangepast):
+
+1. u-boot environment  -- variabele `otg_mode` -> `host`.
+   U-boot schrijft die waarde bij elke boot in de `dr_mode`-property van de
+   dtb, en overschrijft daarmee wat er in het dtb-bestand staat.  Het
+   dtb-bestand zelf patchen heeft dus GEEN effect.
+
+2. Falcon-boot args-blob -- property `dr_mode` -> `host`.
+   Bij Falcon-boot leest SPL de device tree rechtstreeks uit een blob op
+   een vaste eMMC-sector; u-boot proper draait dan niet en `otg_mode` wordt
+   niet geevalueerd.  De blob moet dus apart gepatcht worden.
+
+3. udev-regel `70-gocontroll-usb-role.rules`, die de rol bij elke boot
+   terugzet op `device`, wordt geneutraliseerd (de ACTION-regel wordt
+   uitgecommentarieerd; de uitleg in het bestand blijft staan).
+
+Van alles wat gewijzigd wordt, wordt eerst een back-up gemaakt.  Na het
+schrijven wordt alles opnieuw ingelezen en geverifieerd.
+
+Gebruik
+-------
+    ./gocontroll-usb-hostmode.py            # alleen rapporteren (veilig)
+    ./gocontroll-usb-hostmode.py --apply    # wijzigingen doorvoeren
+    ./gocontroll-usb-hostmode.py --revert   # back-ups terugzetten
+    ./gocontroll-usb-hostmode.py --apply --mode peripheral   # terug naar device
+
+Na `--apply` is een reboot nodig.  Controleren:
+    tr -d '\\0' < /proc/device-tree/soc@0/bus@32c00000/usb@32e40000/dr_mode
+    dmesg | grep 'new .*-speed USB device'      # moet 'high-speed' zijn
+"""
+
+import argparse
+import binascii
+import os
+import shutil
+import struct
+import sys
+
+# ─── Constanten ──────────────────────────────────────────────────────────────
+MMC_DEV = "/dev/mmcblk0"
+MMC_BOOT = "/dev/mmcblk0boot0"
+BACKUP_DIR = "/root/usb-hostmode-backup"
+UDEV_RULE = "/etc/udev/rules.d/70-gocontroll-usb-role.rules"
+
+USB_NODE = "usb@32e40000"
+DR_MODE_PROP = "dr_mode"
+OTG_ENV_VAR = "otg_mode"
+
+FDT_MAGIC = 0xD00DFEED
+FDT_BEGIN_NODE, FDT_END_NODE, FDT_PROP, FDT_NOP, FDT_END = 1, 2, 3, 4, 9
+
+# Kandidaat-sectoren voor de Falcon args-blob (0x1F00 is de GOcontroll-standaard)
+ARGS_SECTORS = [0x1F00]
+# Kandidaat-layouts voor het u-boot env-blok: (offset, grootte, flags-bytes)
+ENV_CANDIDATES = [
+    (0x1FF000, 0x1000, 0),
+    (0x1FE000, 0x2000, 0),
+    (0x1FE000, 0x2000, 1),
+    (0x1FC000, 0x4000, 0),
+    (0x1F8000, 0x8000, 0),
+]
+
+VALID_MODES = ("host", "peripheral", "otg")
+
+
+def align4(n):
+    return (n + 3) & ~3
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# ─── Device tree blob ────────────────────────────────────────────────────────
+def _cstr(buf, off):
+    return buf[off:buf.index(b"\0", off)].decode()
+
+
+def dtb_find_dr_mode(buf):
+    """Zoek de dr_mode-property van de OTG-USB-node.
+
+    Geeft (pos, waarde, bruikbare_ruimte) terug, of None.  `bruikbare_ruimte`
+    telt de aansluitende FDT_NOP's mee: die zijn vrij te hergebruiken.
+    """
+    _, _, off_struct, off_strings = struct.unpack_from(">4I", buf, 0)
+    size_struct = struct.unpack_from(">I", buf, 36)[0]
+    pos, stack, end = off_struct, [], off_struct + size_struct
+
+    while pos < end:
+        token = struct.unpack_from(">I", buf, pos)[0]
+        if token == FDT_BEGIN_NODE:
+            name = _cstr(buf, pos + 4)
+            stack.append(name)
+            pos += 4 + align4(len(name) + 1)
+        elif token == FDT_END_NODE:
+            if stack:
+                stack.pop()
+            pos += 4
+        elif token == FDT_PROP:
+            length, nameoff = struct.unpack_from(">2I", buf, pos + 4)
+            pname = _cstr(buf, off_strings + nameoff)
+            nxt = pos + 12 + align4(length)
+            if stack and stack[-1] == USB_NODE and pname == DR_MODE_PROP:
+                value = bytes(buf[pos + 12:pos + 12 + length])
+                free, scan = align4(length), nxt
+                while scan < end and struct.unpack_from(">I", buf, scan)[0] == FDT_NOP:
+                    free += 4
+                    scan += 4
+                return pos, value, free
+            pos = nxt
+        elif token == FDT_NOP:
+            pos += 4
+        elif token == FDT_END:
+            break
+        else:
+            return None
+    return None
+
+
+def dtb_set_dr_mode(buf, pos, free, mode):
+    """Herschrijf dr_mode in-place; vul restruimte met FDT_NOP.
+
+    Totalsize, alle offsets en de strings-tabel blijven ongewijzigd, zodat de
+    blob op dezelfde plek terug kan.  libfdt slaat NOP's over.
+    """
+    value = mode.encode() + b"\0"
+    need = align4(len(value))
+    if need > free:
+        raise RuntimeError(f"'{mode}' past niet: {need} bytes nodig, {free} vrij")
+    struct.pack_into(">I", buf, pos + 4, len(value))
+    buf[pos + 12:pos + 12 + need] = value.ljust(need, b"\0")
+    for i in range((free - need) // 4):
+        struct.pack_into(">I", buf, pos + 12 + need + i * 4, FDT_NOP)
+
+
+def read_args_blob(sector):
+    """Lees de args-blob op `sector`; None als daar geen bruikbare DTB staat."""
+    try:
+        with open(MMC_DEV, "rb") as f:
+            f.seek(sector * 512)
+            head = f.read(40)
+            if len(head) < 40:
+                return None
+            magic, totalsize = struct.unpack_from(">2I", head, 0)
+            if magic != FDT_MAGIC or not (0x400 < totalsize < 0x100000):
+                return None
+            f.seek(sector * 512)
+            return bytearray(f.read(totalsize))
+    except OSError:
+        return None
+
+
+def write_args_blob(sector, buf):
+    with open(MMC_DEV, "r+b") as f:
+        f.seek(sector * 512)
+        f.write(buf)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+# ─── u-boot environment ──────────────────────────────────────────────────────
+def find_env():
+    """Zoek het env-blok door kandidaat-layouts op CRC32 te toetsen."""
+    try:
+        with open(MMC_BOOT, "rb") as f:
+            for off, size, flags in ENV_CANDIDATES:
+                f.seek(off)
+                blk = f.read(size)
+                if len(blk) != size:
+                    continue
+                stored = struct.unpack_from("<I", blk, 0)[0]
+                data = blk[4 + flags:]
+                if binascii.crc32(data) & 0xFFFFFFFF == stored:
+                    return off, size, flags, data
+    except OSError:
+        pass
+    return None
+
+
+def env_parse(data):
+    entries = []
+    for entry in data.split(b"\0"):
+        if not entry:
+            break
+        entries.append(entry.decode("utf-8", "replace"))
+    return entries
+
+
+def env_build(entries, size, flags):
+    data = b"".join(e.encode() + b"\0" for e in entries) + b"\0"
+    pad = size - 4 - flags - len(data)
+    if pad < 0:
+        raise RuntimeError("environment past niet meer in het blok")
+    data += b"\0" * pad
+    crc = binascii.crc32(data) & 0xFFFFFFFF
+    return struct.pack("<I", crc) + (b"\0" * flags) + data
+
+
+def env_set(off, size, flags, entries, key, value):
+    new, seen = [], False
+    for e in entries:
+        if e.split("=", 1)[0] == key:
+            new.append(f"{key}={value}")
+            seen = True
+        else:
+            new.append(e)
+    if not seen:
+        new.append(f"{key}={value}")
+    blk = env_build(new, size, flags)
+    with boot_partition_writable():
+        with open(MMC_BOOT, "r+b") as f:
+            f.seek(off)
+            f.write(blk)
+            f.flush()
+            os.fsync(f.fileno())
+
+
+class boot_partition_writable:
+    """De eMMC-bootpartitie is standaard read-only; tijdelijk vrijgeven."""
+
+    PATH = "/sys/block/mmcblk0boot0/force_ro"
+
+    def __enter__(self):
+        try:
+            with open(self.PATH, "r") as f:
+                self.previous = f.read().strip()
+            with open(self.PATH, "w") as f:
+                f.write("0")
+        except OSError as exc:
+            raise RuntimeError(f"kan force_ro niet uitzetten: {exc}") from exc
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            with open(self.PATH, "w") as f:
+                f.write(self.previous or "1")
+        except OSError:
+            pass
+        return False
+
+
+# ─── Back-up ─────────────────────────────────────────────────────────────────
+def backup_path(name):
+    return os.path.join(BACKUP_DIR, name)
+
+
+def ensure_backup_dir():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+def backup_once(name, data):
+    """Back-up alleen de EERSTE keer, zodat die de originele staat houdt."""
+    path = backup_path(name)
+    if os.path.exists(path):
+        log(f"    back-up bestaat al: {path} (originele staat behouden)")
+        return
+    with open(path, "wb") as f:
+        f.write(data)
+    log(f"    back-up geschreven: {path}")
+
+
+# ─── udev ────────────────────────────────────────────────────────────────────
+UDEV_MARKER = "# uitgeschakeld door gocontroll-usb-hostmode.py"
+
+
+def udev_status():
+    if not os.path.exists(UDEV_RULE):
+        return "afwezig"
+    with open(UDEV_RULE, "r") as f:
+        text = f.read()
+    active = [ln for ln in text.splitlines()
+              if ln.strip().startswith("ACTION==") and 'role}="device"' in ln]
+    return "actief" if active else "geneutraliseerd"
+
+
+def udev_neutralise():
+    with open(UDEV_RULE, "r") as f:
+        lines = f.read().splitlines()
+    out, changed = [], False
+    for ln in lines:
+        if ln.strip().startswith("ACTION==") and 'role}="device"' in ln:
+            out.append(UDEV_MARKER)
+            out.append("# " + ln)
+            changed = True
+        else:
+            out.append(ln)
+    if changed:
+        with open(UDEV_RULE, "w") as f:
+            f.write("\n".join(out) + "\n")
+    return changed
+
+
+def udev_restore():
+    """Haal de commentaartekens weg die dit script heeft gezet."""
+    if not os.path.exists(UDEV_RULE):
+        return False
+    with open(UDEV_RULE, "r") as f:
+        lines = f.read().splitlines()
+    out, changed, skip_next_marker = [], False, False
+    for ln in lines:
+        if ln.strip() == UDEV_MARKER:
+            skip_next_marker = True
+            changed = True
+            continue
+        if skip_next_marker and ln.startswith("# "):
+            out.append(ln[2:])
+            skip_next_marker = False
+            continue
+        skip_next_marker = False
+        out.append(ln)
+    if changed:
+        with open(UDEV_RULE, "w") as f:
+            f.write("\n".join(out) + "\n")
+    return changed
+
+
+# ─── Acties ──────────────────────────────────────────────────────────────────
+def live_dr_mode():
+    path = f"/proc/device-tree/soc@0/bus@32c00000/{USB_NODE}/dr_mode"
+    try:
+        with open(path, "rb") as f:
+            return f.read().rstrip(b"\0").decode()
+    except OSError:
+        return "onbekend"
+
+
+def report():
+    log("=== Huidige staat ===")
+    log(f"  live dr_mode (draaiende kernel) : {live_dr_mode()}")
+
+    env = find_env()
+    if env:
+        off, size, flags, data = env
+        entries = env_parse(data)
+        value = next((e.split("=", 1)[1] for e in entries
+                      if e.split("=", 1)[0] == OTG_ENV_VAR), "<niet aanwezig>")
+        log(f"  u-boot env  (0x{off:x}, {len(entries)} vars, CRC ok)")
+        log(f"      {OTG_ENV_VAR} = {value}")
+    else:
+        log("  u-boot env  : niet gevonden")
+
+    for sector in ARGS_SECTORS:
+        buf = read_args_blob(sector)
+        if buf is None:
+            log(f"  args-blob   : geen DTB op sector 0x{sector:x}")
+            continue
+        found = dtb_find_dr_mode(buf)
+        if found:
+            _, value, free = found
+            current = value.rstrip(b"\0").decode()
+            log(f"  args-blob   (sector 0x{sector:x}, {len(buf)} bytes)")
+            log(f"      {DR_MODE_PROP} = {current}   (ruimte: {free} bytes)")
+        else:
+            log(f"  args-blob   (sector 0x{sector:x}): {USB_NODE}/{DR_MODE_PROP} niet gevonden")
+
+    log(f"  udev-regel  : {udev_status()}  ({UDEV_RULE})")
+
+
+def apply(mode):
+    if os.geteuid() != 0:
+        sys.exit("Dit script moet als root draaien.")
+    ensure_backup_dir()
+    touched = False
+
+    log(f"=== Instellen op '{mode}' ===")
+
+    # 1. u-boot environment
+    env = find_env()
+    if env:
+        off, size, flags, data = env
+        entries = env_parse(data)
+        current = next((e.split("=", 1)[1] for e in entries
+                        if e.split("=", 1)[0] == OTG_ENV_VAR), None)
+        log(f"[1] u-boot env op 0x{off:x}: {OTG_ENV_VAR} = {current}")
+        if current == mode:
+            log("    staat al goed")
+        else:
+            with open(MMC_BOOT, "rb") as f:
+                f.seek(off)
+                backup_once("uboot-env.bin", f.read(size))
+            env_set(off, size, flags, entries, OTG_ENV_VAR, mode)
+            check = find_env()
+            if not check:
+                sys.exit("FOUT: env-CRC ongeldig na schrijven!")
+            newval = next((e.split("=", 1)[1] for e in env_parse(check[3])
+                           if e.split("=", 1)[0] == OTG_ENV_VAR), None)
+            if newval != mode:
+                sys.exit(f"FOUT: env-verificatie mislukt (leest '{newval}')")
+            log(f"    geschreven en geverifieerd -> {OTG_ENV_VAR}={newval}")
+            touched = True
+    else:
+        log("[1] u-boot env: niet gevonden, overgeslagen")
+
+    # 2. Falcon args-blob
+    for sector in ARGS_SECTORS:
+        buf = read_args_blob(sector)
+        if buf is None:
+            log(f"[2] args-blob sector 0x{sector:x}: geen DTB, overgeslagen")
+            continue
+        found = dtb_find_dr_mode(buf)
+        if not found:
+            log(f"[2] args-blob sector 0x{sector:x}: {DR_MODE_PROP} niet gevonden")
+            continue
+        pos, value, free = found
+        current = value.rstrip(b"\0").decode()
+        log(f"[2] args-blob sector 0x{sector:x}: {DR_MODE_PROP} = {current}")
+        if current == mode:
+            log("    staat al goed")
+            continue
+        backup_once(f"args-blob-sector-{sector:#x}.dtb", bytes(buf))
+        dtb_set_dr_mode(buf, pos, free, mode)
+        write_args_blob(sector, buf)
+        verify = read_args_blob(sector)
+        vfound = dtb_find_dr_mode(verify) if verify else None
+        if not vfound or vfound[1].rstrip(b"\0").decode() != mode:
+            sys.exit("FOUT: args-blob verificatie mislukt!")
+        log(f"    geschreven en geverifieerd -> {DR_MODE_PROP}={mode}")
+        touched = True
+
+    # 3. udev-regel
+    status = udev_status()
+    log(f"[3] udev-regel: {status}")
+    if mode == "host":
+        if status == "actief":
+            with open(UDEV_RULE, "rb") as f:
+                backup_once("70-gocontroll-usb-role.rules", f.read())
+            if udev_neutralise():
+                log("    ACTION-regel uitgecommentarieerd")
+                touched = True
+        elif status == "geneutraliseerd":
+            log("    al geneutraliseerd")
+    else:
+        if status == "geneutraliseerd" and udev_restore():
+            log("    ACTION-regel weer geactiveerd")
+            touched = True
+
+    log("")
+    if touched:
+        log(">>> Klaar. REBOOT is nodig om de wijziging actief te maken.")
+    else:
+        log(">>> Er was niets te wijzigen; de controller stond al goed.")
+    log("    Controleren na de reboot:")
+    log(f"      tr -d '\\0' < /proc/device-tree/soc@0/bus@32c00000/{USB_NODE}/dr_mode")
+    log("      dmesg | grep 'new .*-speed USB device'   # moet 'high-speed' zijn")
+
+
+def revert():
+    if os.geteuid() != 0:
+        sys.exit("Dit script moet als root draaien.")
+    if not os.path.isdir(BACKUP_DIR):
+        sys.exit(f"Geen back-ups gevonden in {BACKUP_DIR}")
+    log(f"=== Terugzetten uit {BACKUP_DIR} ===")
+    done = False
+
+    env_bak = backup_path("uboot-env.bin")
+    if os.path.exists(env_bak):
+        env = find_env()
+        if env:
+            off, size, _, _ = env
+            with open(env_bak, "rb") as f:
+                blob = f.read()
+            with boot_partition_writable():
+                with open(MMC_BOOT, "r+b") as f:
+                    f.seek(off)
+                    f.write(blob[:size])
+                    f.flush()
+                    os.fsync(f.fileno())
+            log("  u-boot env teruggezet")
+            done = True
+
+    for name in os.listdir(BACKUP_DIR):
+        if not name.startswith("args-blob-sector-"):
+            continue
+        sector = int(name.split("-")[-1].replace(".dtb", ""), 0)
+        with open(backup_path(name), "rb") as f:
+            write_args_blob(sector, f.read())
+        log(f"  args-blob sector {sector:#x} teruggezet")
+        done = True
+
+    rule_bak = backup_path("70-gocontroll-usb-role.rules")
+    if os.path.exists(rule_bak):
+        shutil.copyfile(rule_bak, UDEV_RULE)
+        log("  udev-regel teruggezet")
+        done = True
+
+    log("")
+    log(">>> Klaar, reboot nodig." if done else ">>> Niets teruggezet.")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Zet de OTG-USB-poort van een Moduline-controller in host-modus.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Zonder opties wordt alleen de huidige staat gerapporteerd.",
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--apply", action="store_true", help="wijzigingen doorvoeren")
+    g.add_argument("--revert", action="store_true", help="back-ups terugzetten")
+    p.add_argument("--mode", default="host", choices=VALID_MODES,
+                   help="doelmodus (standaard: host)")
+    args = p.parse_args()
+
+    if args.revert:
+        revert()
+    elif args.apply:
+        apply(args.mode)
+    else:
+        report()
+        log("")
+        log("Niets gewijzigd.  Gebruik --apply om de wijziging door te voeren.")
+
+
+if __name__ == "__main__":
+    main()

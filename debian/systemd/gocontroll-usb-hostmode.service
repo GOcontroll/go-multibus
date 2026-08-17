@@ -1,0 +1,30 @@
+[Unit]
+Description=Put the Moduline OTG USB port in host mode
+Documentation=file:/usr/share/doc/go-multibus/go-multibus.md
+DefaultDependencies=no
+After=local-fs.target
+Before=go-multibus.service
+ConditionPathExists=/proc/device-tree/soc@0/bus@32c00000/usb@32e40000/dr_mode
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Only acts on a controller that is not already in host mode, so on a
+# provisioned board this is a no-op that costs one file read.
+#
+# The change lands in the u-boot environment and the Falcon boot blob, so it
+# only takes effect on the next boot - a module plugged into a freshly
+# provisioned controller enumerates one reboot later, not immediately. The tool
+# backs up everything it touches and verifies what it wrote.
+ExecStart=/bin/sh -c '\
+    mode=$$(tr -d "\\0" < /proc/device-tree/soc@0/bus@32c00000/usb@32e40000/dr_mode); \
+    if [ "$$mode" = host ]; then \
+        echo "OTG port already in host mode"; \
+        exit 0; \
+    fi; \
+    echo "OTG port is in $$mode mode; switching to host - takes effect after a reboot"; \
+    /usr/bin/gocontroll-usb-hostmode --apply'
+
+[Install]
+WantedBy=multi-user.target

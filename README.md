@@ -17,6 +17,9 @@ the controller beyond the interpreter it already has.
 ## CLI
 
 ```sh
+gocontroll-usb-hostmode                  # report the OTG port's mode
+gocontroll-usb-hostmode --apply          # put it in host mode (needs a reboot)
+
 go-multibus                              # interactive UI (no arguments)
 go-multibus daemon                       # background service, systemd entry
 go-multibus status                       # one-shot summary, scriptable
@@ -148,22 +151,54 @@ the cell data and configures the module some other way. Do not run both.
 ## Installing
 
 ```sh
-install -m 755 bin/go-multibus            /usr/bin/go-multibus
-install -m 755 bin/gocontroll-cellmon     /usr/bin/gocontroll-cellmon
-install -m 755 bin/gocontroll-modulebus   /usr/bin/gocontroll-modulebus
-install -d /usr/lib/gocontroll-multibus
-install -m 644 lib/*.py                   /usr/lib/gocontroll-multibus/
-install -m 644 debian/systemd/*.service   /etc/systemd/system/
-install -m 644 debian/udev/81-gocontroll-multibus.rules /etc/udev/rules.d/
-install -m 755 debian/udev/gocontroll-multibus-canname  /lib/udev/
-udevadm control --reload-rules && udevadm trigger --action=add
-systemctl daemon-reload
+apt-get install go-multibus
 ```
 
-`./install.sh` does the same thing.
+That is everything a fresh controller needs: the tools, the service, the udev
+naming rules, and `gocontroll-usb-hostmode` for the OTG port. Both services are
+enabled but not started - at install time there may be no controller under the
+filesystem, and on real hardware starting the service resets the module and
+raises CAN interfaces, which an install should not do underneath a running
+machine.
 
-A checkout runs without installing: the entry points in `bin/` add `../lib` to
-their import path.
+```sh
+systemctl start go-multibus
+```
+
+**A controller whose OTG port is still in device mode needs one reboot.**
+`gocontroll-usb-hostmode.service` runs before `go-multibus`, notices the port is
+not in host mode, and applies the change - but that lands in the u-boot
+environment and the Falcon boot blob, so it only takes effect on the next boot.
+Until then no module enumerates. On a controller that is already in host mode
+the service is a no-op that costs one file read.
+
+From a checkout, `./install.sh` puts the same files in the same places. A
+checkout also runs without installing at all: the entry points in `bin/` add
+`../lib` to their import path.
+
+### Building the package
+
+```sh
+debian/build-deb.sh 0.1.0 dist
+```
+
+The same script the release workflow runs, so what CI publishes is what you can
+build and inspect locally. Tagging `v*` builds it, attaches it to a GitHub
+release, and tells the GOcontroll apt index to pick it up.
+
+## USB host mode
+
+The i.MX8 OTG port comes up as a USB *device* by default. A module plugged into
+it never enumerates until the port is a host, and `dr_mode = "otg"` with a
+runtime role switch is not enough - the chipidea driver switches the controller
+but does not fully initialise the PHY, so the high-speed chirp fails and
+descriptor transfers die with `-71`. Only `dr_mode = "host"` gives a full host
+init.
+
+`gocontroll-usb-hostmode` sets that, in both places a Moduline can boot from:
+the `otg_mode` u-boot variable and the Falcon boot args blob. It backs up
+everything it touches and verifies what it wrote. Run it without arguments to
+see the current state; `--apply` changes it, `--revert` puts the backups back.
 
 ## Module firmware
 
