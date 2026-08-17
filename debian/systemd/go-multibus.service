@@ -1,0 +1,23 @@
+[Unit]
+Description=GOcontroll Multibus module service
+Documentation=file:/usr/share/doc/gocontroll/go-multibus.md
+# The service resets the module itself, so it only needs the slot reset lines
+# and spidev to exist. It waits for USB on its own.
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/go-multibus daemon
+# The service already retries every failure internally, so a restart here is
+# only for the case where the process itself dies.
+Restart=always
+RestartSec=5
+
+# Needs spidev, the leds interface for the slot reset, and `ip` for the CAN
+# interfaces, so it runs unconfined apart from the filesystem.
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

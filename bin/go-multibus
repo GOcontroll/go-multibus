@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""go-multibus: run and configure the Multibus module on a GOcontroll controller.
+
+Two ways to use it, sharing one state machine:
+
+  go-multibus.py daemon     background service: brings the module up, keeps it
+                            running, publishes cell data to /dev/shm
+  go-multibus.py            terminal UI: shows what the module is doing and
+                            lets you change the interface configuration
+
+The UI is what you reach for while commissioning a machine; the daemon is what
+runs at boot. Both drive the same sequence - reset, start the application,
+configure the interfaces over SPI, wait for USB, then poll isoSPI - so what you
+see in the UI is exactly what the service does.
+
+  go-multibus.py status     one-shot summary, for scripts and for ssh
+  go-multibus.py config     show the stored configuration
+  go-multibus.py set 1 can  change one interface and store it
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+from typing import List, Optional
+
+# Find the shared modules whether this runs from a checkout or from a package.
+# Later inserts win, so the checkout's lib/ takes precedence over an installed
+# copy - which is what you want while developing on a controller that also has
+# the package installed.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in ("/usr/lib/gocontroll-multibus",
+                   _HERE,
+                   os.path.join(os.path.dirname(_HERE), "lib")):
+    if os.path.isdir(_candidate):
+        sys.path.insert(0, _candidate)
+
+from gocontroll_multibus import MODE_NAMES, MultibusError  # noqa: E402
+from gocontroll_multibus_service import (  # noqa: E402
+    CONFIG_PATH,
+    STATE_PATH,
+    Config,
+    ModuleSupervisor,
+    State,
+)
+
+# Which modes each connector interface accepts, and the pins it lands on.
+# Mirrors MbInterfaces.c; see Documentation/multibus-interfaces.md.
+INTERFACE_CHOICES = {
+    1: (["can"], "6/5"),
+    2: (["rs485", "rs232", "off"], "12/13"),
+    3: (["rs485", "can", "off"], "18/19"),
+    4: (["rs485", "can", "off"], "24/25"),
+    5: (["isospi", "off"], "isoSPI"),
+}
+
+STATE_LABEL = {
+    State.RESET: "resetting the module",
+    State.START: "starting the application",
+    State.CONFIGURE: "configuring interfaces over SPI",
+    State.ENUMERATE: "waiting for USB",
+    State.RUNNING: "running",
+    State.FAILED: "not reachable - see the log below",
+}
+
+
+# ── daemon ───────────────────────────────────────────────────────────────────
+
+def cmd_daemon(args) -> int:
+    config = Config.load(args.config)
+    supervisor = ModuleSupervisor(
+        config,
+        log=lambda message: print(message, file=sys.stderr, flush=True))
+
+    stopping = {"now": False}
+
+    def handle_signal(_signum, _frame):
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    try:
+        while not stopping["now"]:
+            supervisor.step()
+            # A tenth of a second is short enough that the publish interval is
+            # honoured accurately and long enough to keep the loop cheap while
+            # the module is only being polled.
+            time.sleep(0.1)
+    finally:
+        supervisor.close()
+
+    return 0
+
+
+# ── one-shot reporting ───────────────────────────────────────────────────────
+
+def read_json(path: str) -> Optional[dict]:
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_status(args) -> int:
+    state = read_json(STATE_PATH)
+    cells = read_json(Config.load(args.config).output)
+
+    if state is None:
+        print("the service is not running (no %s)" % STATE_PATH)
+        return 1
+
+    print("state      : %s" % STATE_LABEL.get(state["state"], state["state"]))
+    print("slot       : %s" % state["slot"])
+    print("interfaces : %s" % ", ".join(state["interfaces"] or ["unknown"]))
+    if state.get("last_error"):
+        print("last error : %s" % state["last_error"])
+
+    if cells and cells.get("valid"):
+        print("cells      : %d, pack %.3f V, spread %.4f V%s"
+              % (cells["cell_count"], cells["pack_v"], cells["spread_v"],
+                 " (simulated)" if cells.get("simulated") else ""))
+    elif cells:
+        print("cells      : no valid data")
+
+    return 0
+
+
+def cmd_config(args) -> int:
+    config = Config.load(args.config)
+    print("stored in %s" % args.config)
+    for number in range(1, 6):
+        choices, pins = INTERFACE_CHOICES[number]
+        print("  interface %d  pins %-6s  %-7s (can be %s)"
+              % (number, pins, config.interfaces[number - 1], "/".join(choices)))
+    print("  cells %d, module polls every %d ms, published every %.1f s"
+          % (config.cell_count, config.module_poll_ms, config.publish_interval_s))
+    return 0
+
+
+def cmd_set(args) -> int:
+    config = Config.load(args.config)
+
+    choices, _pins = INTERFACE_CHOICES.get(args.interface, ([], ""))
+    if not choices:
+        print("interface must be 1..5")
+        return 2
+    if args.mode not in choices:
+        print("interface %d can be %s" % (args.interface, ", ".join(choices)))
+        return 2
+
+    config.interfaces[args.interface - 1] = args.mode
+    config.save(args.config)
+
+    print("interface %d is now %s" % (args.interface, args.mode))
+    print("restart the service to apply it: systemctl restart go-multibus")
+    return 0
+# ── terminal UI ──────────────────────────────────────────────────────────────
+#
+# Deliberately modelled on go-can's TUI so the two tools feel like one set:
+# orange title, rule lines, a cyan caret on the selected row, green for the
+# value that is actually in force, a dark-grey key hint at the bottom, and
+# Enter to descend into a picker with Esc or Left to come back.
+#
+# One thing differs, and it has to. go-can blocks in event::read() and redraws
+# only on a keypress; this tool also polls a module over USB, so it redraws on a
+# timer as well. The screen is painted before the poll runs, so a module that
+# stops answering never leaves a blank terminal behind.
+
+VERSION = "0.1.0"
+
+RULE = "  ------------------------------------"
+CARET = "►"          # ►
+ARROW_UD = "↑/↓"  # ↑/↓
+ARROW_L = "←"        # ←
+EMDASH = "—"         # —
+
+# Screens.
+VIEW_LIST = "list"
+VIEW_MODE = "mode"
+VIEW_CELLS = "cells"
+
+
+class Palette:
+    """Colour pairs, degrading gracefully on a terminal with few colours."""
+
+    def __init__(self, curses_mod):
+        curses = curses_mod
+        self.ok = curses.A_NORMAL
+
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+        except curses.error:
+            self.title = self.sel = self.good = self.bad = self.dim = curses.A_NORMAL
+            return
+
+        colours = getattr(curses, "COLORS", 8)
+
+        # go-can paints its title in RGB(255,102,0) = #FF6600, straight out of
+        # crossterm as a 24-bit colour. curses has no truecolor, so match it as
+        # closely as the terminal allows:
+        #
+        #   redefinable palette -> set the slot to exactly #FF6600
+        #   256 colours         -> 202 (#FF5F00), the nearest cube entry
+        #   fewer               -> plain yellow
+        #
+        # 202 rather than 208: 208 is #FF8700, visibly more yellow than go-can's
+        # orange, while 202 is off by seven counts of green.
+        orange = curses.COLOR_YELLOW
+        if colours >= 256:
+            orange = 202
+            try:
+                if curses.can_change_color():
+                    # init_color scales each channel to 0..1000.
+                    curses.init_color(orange, 1000, 400, 0)
+            except curses.error:
+                pass          # keep the approximation
+
+        # Likewise for "dark grey": 8 is bright black, and A_DIM stands in.
+        grey = 8 if colours >= 16 else curses.COLOR_WHITE
+
+        curses.init_pair(1, orange, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
+        curses.init_pair(5, grey, -1)
+
+        # No A_BOLD: go-can prints the title in plain orange, and bold brightens
+        # a 256-colour foreground on some terminals, which would put the two
+        # tools a shade apart again.
+        self.title = curses.color_pair(1)
+        self.sel = curses.color_pair(2)
+        self.good = curses.color_pair(3)
+        self.bad = curses.color_pair(4)
+        self.dim = curses.color_pair(5)
+        if colours < 16:
+            self.dim |= curses.A_DIM
+
+
+class Screen:
+    """Line-oriented writer that clips to the window instead of raising."""
+
+    def __init__(self, window):
+        self.window = window
+        self.row = 0
+        self.height, self.width = window.getmaxyx()
+
+    def line(self, text="", attr=0) -> None:
+        if self.row >= self.height:
+            return
+        try:
+            self.window.addnstr(self.row, 0, text, self.width - 1, attr)
+        except Exception:
+            pass          # a resize mid-draw must not take the tool down
+        self.row += 1
+
+    def wrapped(self, text: str, attr=0, indent: str = "    ") -> None:
+        """One message over as many rows as it needs, continuations indented."""
+        import textwrap
+
+        width = max(20, self.width - 3)
+        lines = textwrap.wrap(text, width=width,
+                              initial_indent="  ", subsequent_indent=indent)
+        for line in lines or ["  "]:
+            self.line(line, attr)
+
+    def parts(self, chunks) -> None:
+        """One row assembled from (text, attr) pieces."""
+        if self.row >= self.height:
+            return
+        column = 0
+        for text, attr in chunks:
+            if column >= self.width - 1:
+                break
+            try:
+                self.window.addnstr(self.row, column, text,
+                                    self.width - 1 - column, attr)
+            except Exception:
+                pass
+            column += len(text)
+        self.row += 1
+
+
+def service_is_active(unit: str = "go-multibus") -> bool:
+    """Whether the daemon is running and therefore owns the protocol port."""
+    import subprocess
+
+    try:
+        result = subprocess.run(["systemctl", "is-active", "--quiet", unit],
+                                capture_output=True, timeout=5)
+        return result.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return False          # no systemd, or it did not answer: assume free
+
+
+def read_key(window, curses):
+    """getch(), with the arrow keys decoded whichever form they arrive in.
+
+    keypad(True) puts the terminal in application cursor mode, where Down is
+    `ESC O B`, and curses decodes that through terminfo. A terminal left in
+    normal mode sends `ESC [ B` instead, which curses does not recognise: it
+    hands back a bare ESC and then the two remaining characters. Since Esc is
+    the key that leaves a screen, that turns an arrow press into an unexpected
+    exit.
+
+    So a lone ESC is followed up on briefly. Anything that completes a cursor
+    sequence becomes the matching key; anything else really was Esc.
+    """
+    key = window.getch()
+    if key != 27:
+        return key
+
+    window.timeout(25)          # about the usual ESCDELAY
+    try:
+        second = window.getch()
+        if second not in (ord("["), ord("O")):
+            return 27
+        third = window.getch()
+    finally:
+        window.timeout(200)
+
+    return {
+        ord("A"): curses.KEY_UP,
+        ord("B"): curses.KEY_DOWN,
+        ord("C"): curses.KEY_RIGHT,
+        ord("D"): curses.KEY_LEFT,
+    }.get(third, 27)
+
+
+def mode_label(name: str) -> str:
+    """Mode name as it is written on the connector, not as it is stored."""
+    return {"can": "CAN", "rs485": "RS485", "rs232": "RS232",
+            "isospi": "isoSPI", "off": "Off"}.get(name, name)
+
+
+def cmd_ui(args) -> int:
+    # Without a terminal on both ends curses fails deep inside its setup with an
+    # unhelpful "cbreak() returned ERR", after it has already switched to the
+    # alternate screen. Check first and say what to run instead.
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("go-multibus with no arguments starts the interactive UI, which "
+              "needs a terminal.\nFor scripts and pipes use: go-multibus status, "
+              "config, or set.", file=sys.stderr)
+        return 2
+
+    # Nothing stops two processes opening the same tty, so the UI and the daemon
+    # would both write requests into one port and read each other's answers.
+    # That looks like a flaky module rather than like a conflict, so refuse.
+    if service_is_active():
+        print("the go-multibus service is running and already holds the "
+              "protocol port.\n"
+              "Stop it to use the UI:   systemctl stop go-multibus\n"
+              "Or read what it reports: go-multibus status",
+              file=sys.stderr)
+        return 1
+
+    try:
+        import curses
+    except ImportError:
+        print("this Python has no curses support; use 'status' instead",
+              file=sys.stderr)
+        return 1
+
+    # curses needs the locale set before it will render anything outside ASCII,
+    # and the caret and arrows in the key hints are outside it.
+    import locale
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+
+    return curses.wrapper(lambda window: _run_ui(window, args))
+
+
+def _run_ui(window, args) -> int:
+    import curses
+
+    curses.curs_set(0)
+    window.keypad(True)
+    window.timeout(200)
+
+    # ncurses holds a lone Esc for ESCDELAY - a full second by default - while
+    # it waits to see whether an escape sequence follows. Esc is how you leave a
+    # screen here, so a second of nothing makes the tool feel broken, and a key
+    # pressed inside that second gets swallowed into the pending sequence.
+    # 25 ms is long enough for a real sequence to arrive whole and short enough
+    # to feel immediate, which is where crossterm - and so go-can - already sits.
+    try:
+        curses.set_escdelay(25)
+    except (AttributeError, curses.error):
+        pass          # Python < 3.9; read_key still recovers the arrow keys
+
+    palette = Palette(curses)
+
+    config = Config.load(args.config)
+    messages: List[str] = []
+
+    def log(message: str) -> None:
+        messages.append("%s  %s" % (time.strftime("%H:%M:%S"), message))
+        del messages[:-4]
+
+    # Attach to whatever is already running rather than resetting the module:
+    # opening the UI to look at a live machine must not interrupt it. Short
+    # timeouts, because every second a step blocks is a second the UI does not
+    # repaint or read the keyboard.
+    supervisor = ModuleSupervisor(config, log=log,
+                                  start_state=State.ENUMERATE,
+                                  auto_reset=False,
+                                  link_timeout=0.4, link_retries=1,
+                                  enumeration_timeout=0.5)
+
+    view = VIEW_LIST
+    cursor = 0            # selected interface, 0-based
+    choice = 0            # selected mode inside the picker
+    error: Optional[str] = None
+    next_step = 0.0
+
+    try:
+        while True:
+            screen = Screen(window)
+            window.erase()
+
+            _draw_header(screen, palette, supervisor, config)
+
+            if view == VIEW_LIST:
+                _draw_list(screen, palette, supervisor, config, cursor)
+            elif view == VIEW_MODE:
+                _draw_mode(screen, palette, config, cursor, choice, error)
+            else:
+                _draw_cells(screen, palette, supervisor)
+
+            if view != VIEW_MODE and messages:
+                screen.line(RULE)
+                for message in messages:
+                    # Wrap rather than clip: the tail of a diagnostic is where
+                    # it says what to do about the problem, and that is exactly
+                    # what falls off the right-hand edge.
+                    screen.wrapped(message, palette.dim)
+
+            window.refresh()
+
+            # Advance the module state machine after painting, and only every so
+            # often: an unreachable module costs a timeout per attempt, and
+            # retrying that on every 200 ms tick would make the UI crawl.
+            if time.monotonic() >= next_step:
+                supervisor.step()
+                next_step = time.monotonic() + (
+                    0.2 if supervisor.state == State.RUNNING else 2.0)
+
+            key = read_key(window, curses)
+            if key == -1:
+                continue
+
+            if view == VIEW_LIST:
+                if key in (ord("q"), ord("Q"), 27):        # 27 = Esc
+                    break
+                elif key == curses.KEY_UP:
+                    cursor = max(0, cursor - 1)
+                elif key == curses.KEY_DOWN:
+                    cursor = min(len(INTERFACE_CHOICES) - 1, cursor + 1)
+                elif key in (curses.KEY_ENTER, 10, 13, curses.KEY_RIGHT):
+                    choices, _pins = INTERFACE_CHOICES[cursor + 1]
+                    current = config.interfaces[cursor]
+                    choice = choices.index(current) if current in choices else 0
+                    error = None
+                    view = VIEW_MODE
+                elif key in (ord("c"), ord("C")):
+                    view = VIEW_CELLS
+                elif key in (ord("r"), ord("R")):
+                    log("resetting the module")
+                    supervisor.restart(full=True)
+                    next_step = 0.0
+
+            elif view == VIEW_MODE:
+                choices, _pins = INTERFACE_CHOICES[cursor + 1]
+                if key in (27, curses.KEY_LEFT, ord("q"), ord("Q")):
+                    view = VIEW_LIST
+                elif key == curses.KEY_UP:
+                    choice = max(0, choice - 1)
+                elif key == curses.KEY_DOWN:
+                    choice = min(len(choices) - 1, choice + 1)
+                elif key in (curses.KEY_ENTER, 10, 13):
+                    error = _apply_mode(config, args, supervisor, log,
+                                        cursor, choices[choice])
+                    if error is None:
+                        next_step = 0.0
+                        view = VIEW_LIST
+
+            else:   # VIEW_CELLS
+                if key in (27, curses.KEY_LEFT, ord("q"), ord("Q"),
+                           ord("c"), ord("C")):
+                    view = VIEW_LIST
+
+    except KeyboardInterrupt:
+        pass          # Ctrl+C is a normal way to leave a full-screen tool
+    finally:
+        # Cleanup must never be the thing that crashes: a second Ctrl+C landing
+        # here used to surface as EBADF on top of the original traceback.
+        try:
+            supervisor.close()
+        except Exception:
+            pass
+
+    return 0
+
+
+def _apply_mode(config, args, supervisor, log, index: int,
+                mode: str) -> Optional[str]:
+    """Store a mode and put it into effect. Returns an error text, or None.
+
+    Storing and applying happen together, the way go-can's picker writes the
+    config file and configures the interface in one keypress. Applying implies a
+    module reset: the configuration travels over the module bus, which is only
+    read before USB comes up.
+    """
+    previous = config.interfaces[index]
+    config.interfaces[index] = mode
+
+    try:
+        config.save(args.config)
+    except OSError as failure:
+        config.interfaces[index] = previous
+        return "cannot write %s: %s" % (args.config, failure)
+
+    log("interface %d %s %s, resetting" % (index + 1, EMDASH, mode_label(mode)))
+    supervisor.config = config
+    supervisor.restart(full=True)
+    return None
+
+
+def _draw_header(screen: Screen, palette: Palette, supervisor, config) -> None:
+    screen.line("  GOcontroll Moduline Multibus tool  v" + VERSION, palette.title)
+    screen.line(RULE)
+
+    state_attr = (palette.good if supervisor.state == State.RUNNING
+                  else palette.bad if supervisor.state == State.FAILED
+                  else palette.dim)
+    screen.parts([
+        ("  Module: slot %d   " % config.slot, 0),
+        (STATE_LABEL.get(supervisor.state, supervisor.state), state_attr),
+    ])
+    screen.line(RULE)
+
+
+def _draw_list(screen: Screen, palette: Palette, supervisor, config,
+               cursor: int) -> None:
+    # What the module actually reports, so a refused configuration is visible
+    # rather than looking like it was applied.
+    active = supervisor.applied_interfaces if len(
+        supervisor.applied_interfaces) == 5 else None
+
+    for index in range(5):
+        number = index + 1
+        choices, pins = INTERFACE_CHOICES[number]
+        wanted = config.interfaces[index]
+        selected = index == cursor
+        fixed = len(choices) == 1
+
+        row = [
+            (("  %s " % CARET) if selected else "    ", palette.sel),
+            ("Interface %d  " % number, 0),
+            ("%-8s " % pins, palette.dim),
+        ]
+
+        if selected:
+            row.append(("%-8s" % mode_label(wanted), 0))
+        else:
+            row.append(("%-8s" % mode_label(wanted),
+                        palette.dim if wanted == "off" else palette.good))
+
+        if active is not None:
+            live = MODE_NAMES.get(active[index], "?")
+            if live != wanted:
+                row.append(("  module has %s" % mode_label(live), palette.bad))
+            elif fixed:
+                row.append(("  fixed", palette.dim))
+        elif fixed:
+            row.append(("  fixed", palette.dim))
+
+        screen.parts(row)
+
+    screen.line(RULE)
+    screen.line("  %s navigate   Enter select mode   c cells   r reset   q quit"
+                % ARROW_UD, palette.dim)
+
+
+def _draw_mode(screen: Screen, palette: Palette, config, cursor: int,
+               choice: int, error: Optional[str]) -> None:
+    number = cursor + 1
+    choices, pins = INTERFACE_CHOICES[number]
+    current = config.interfaces[cursor]
+
+    screen.line("  Interface %d  (pins %s)  %s  Select Mode" % (number, pins, EMDASH))
+    screen.line()
+
+    for index, name in enumerate(choices):
+        label = mode_label(name)
+        if index == choice:
+            screen.parts([("  %s " % CARET, palette.sel), (label, 0)])
+        elif name == current:
+            screen.parts([("    ", 0), (label, palette.good)])
+        else:
+            screen.line("    " + label)
+
+    screen.line(RULE)
+    screen.line("  %s navigate   Enter apply (resets module)   %s/Esc back"
+                % (ARROW_UD, ARROW_L), palette.dim)
+
+    if len(choices) == 1:
+        screen.line()
+        screen.line("  This interface is not configurable.", palette.dim)
+
+    if error:
+        screen.line()
+        screen.line("  Error: %s" % error, palette.bad)
+
+
+def _draw_cells(screen: Screen, palette: Palette, supervisor) -> None:
+    snapshot = supervisor.snapshot
+
+    if snapshot is None or not snapshot.cells_100uv:
+        screen.line("  Cells  %s  no data" % EMDASH)
+        screen.line()
+        screen.line("  The module has not reported a cell snapshot yet.",
+                    palette.dim)
+        screen.line(RULE)
+        screen.line("  %s/Esc back   q quit" % ARROW_L, palette.dim)
+        return
+
+    flags = []
+    if snapshot.simulated:
+        flags.append("SIMULATED")
+    if snapshot.stale:
+        flags.append("STALE")
+    if snapshot.undervoltage:
+        flags.append("UNDERVOLTAGE")
+    if snapshot.overvoltage:
+        flags.append("OVERVOLTAGE")
+
+    screen.parts([
+        ("  Cells  %s  pack %.3f V   spread %.4f V   "
+         % (EMDASH, snapshot.pack_v, snapshot.spread_v), 0),
+        (" ".join(flags), palette.bad if flags else 0),
+    ])
+    screen.line()
+
+    voltages = snapshot.cells_v
+    lowest = min(range(len(voltages)), key=lambda i: voltages[i])
+    highest = max(range(len(voltages)), key=lambda i: voltages[i])
+
+    # Four to a row keeps a 24 cell pack on one screen.
+    for start in range(0, len(voltages), 4):
+        row = [("  ", 0)]
+        for index in range(start, min(start + 4, len(voltages))):
+            attr = (palette.sel if index in (lowest, highest) else 0)
+            mark = "v" if index == lowest else "^" if index == highest else " "
+            row.append(("%2d %.4f%s   " % (index + 1, voltages[index], mark), attr))
+        screen.parts(row)
+
+    if snapshot.temperatures_c:
+        screen.line()
+        screen.line("  Temperatures: " + "   ".join(
+            "%.1f C" % value for value in snapshot.temperatures_c))
+
+    screen.line(RULE)
+    screen.line("  %s/Esc back   q quit" % ARROW_L, palette.dim)
+
+
+# ── entry point ──────────────────────────────────────────────────────────────
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    parser.add_argument("-c", "--config", default=CONFIG_PATH,
+                        help="configuration file (default %s)" % CONFIG_PATH)
+
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("daemon", help="run as a background service")
+    subparsers.add_parser("status", help="one-shot summary of what the service is doing")
+    subparsers.add_parser("config", help="show the stored configuration")
+
+    setter = subparsers.add_parser("set", help="change one interface and store it")
+    setter.add_argument("interface", type=int, help="connector interface, 1..5")
+    setter.add_argument("mode", help="can, rs485, rs232, isospi or off")
+
+    args = parser.parse_args()
+
+    handlers = {
+        "daemon": cmd_daemon,
+        "status": cmd_status,
+        "config": cmd_config,
+        "set": cmd_set,
+        None: cmd_ui,          # no subcommand starts the UI
+    }
+
+    try:
+        return handlers[args.command](args)
+    except MultibusError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

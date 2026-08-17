@@ -1,0 +1,101 @@
+#!/bin/sh
+# Print the deterministic name for one Multibus gs_usb CAN interface.
+#
+# Called from 81-gocontroll-multibus.rules with the kernel name of the netdev
+# being processed. Prints a name like "mb_can3" and nothing else, because udev
+# takes the whole of stdout as the new interface name.
+#
+# Why this is needed: the kernel numbers CAN interfaces in the order it finds
+# them, and how many it has already found depends on the controller. A Moduline
+# IV has four mcp251x controllers, so the module lands on can4..can6; an M1 has
+# two, so the same module lands on can2..can4. Anything that hard-codes a name
+# is therefore wrong on some controller.
+#
+# The names follow the knowledge base, which numbers the buses CAN 1, CAN 2 and
+# CAN 3:
+#
+#   channel 0 -> mb_can1   CAN 1, connector interface 1
+#   channel 1 -> mb_can2   CAN 2, connector interface 3, shares pins with RS485 2
+#   channel 2 -> mb_can3   CAN 3, connector interface 4, shares pins with RS485 3
+#
+# Mind the two numbering schemes: the bus numbers here are not the connector
+# interface numbers used in MbInterfaces.c. CAN 2 is connector interface 3.
+# See Documentation/multibus-interfaces.md.
+#
+# The channel index is recovered from the creation order of the netdevs, which
+# is the order gs_usb registers its channels in. ifindex is the kernel's
+# creation counter, so counting how many siblings have a lower ifindex than this
+# one gives its channel index.
+#
+# Note what this deliberately does NOT do: look siblings up by name. udev
+# processes the three add events concurrently and renames as it goes, so any
+# name read here can be stale by the time it is used - which showed up as one of
+# the three interfaces keeping its kernel name. Reading ifindex straight out of
+# the sibling's own directory uses no names at all, so a rename racing alongside
+# cannot affect the count.
+#
+# Counting is safe even when udev runs the events out of order: gs_usb registers
+# every netdev before its uevent can be processed, so all siblings are already
+# present in sysfs whichever one is handled first.
+
+name="$1"
+[ -n "$name" ] || exit 1
+
+sysdev="/sys/class/net/$name"
+[ -d "$sysdev" ] || exit 1
+
+my_index=$(cat "$sysdev/ifindex" 2>/dev/null) || exit 1
+[ -n "$my_index" ] || exit 1
+
+# All netdevs of the same USB interface live under its "net" directory.
+usbif=$(readlink -f "$sysdev/device" 2>/dev/null) || exit 1
+[ -d "$usbif/net" ] || exit 1
+
+# Count siblings with a lower ifindex; that count is the channel number.
+#
+# Retried until every entry could be read. udev handles the three add events
+# concurrently and renames as it goes, so a sibling's directory entry can vanish
+# from under this loop mid-pass. Skipping it would undercount and hand back the
+# name of an earlier channel - which udev then refuses with "File exists",
+# leaving that interface on its kernel name. Seen exactly that on the third
+# interface.
+channel=""
+attempt=0
+previous=-1
+while [ "$attempt" -lt 40 ]; do
+    seen=0
+    total=0
+    lower=0
+    for sibling in "$usbif"/net/*; do
+        [ -d "$sibling" ] || continue
+        total=$((total + 1))
+        sibling_index=$(cat "$sibling/ifindex" 2>/dev/null) || continue
+        [ -n "$sibling_index" ] || continue
+        seen=$((seen + 1))
+        [ "$sibling_index" -lt "$my_index" ] && lower=$((lower + 1))
+    done
+
+    # Accept only once the set has stopped changing: every entry readable, and
+    # the same number of them as on the previous pass. Requiring readability
+    # alone is not enough - the siblings appear one at a time as gs_usb
+    # registers them, so an early pass can be internally consistent and still
+    # be missing a channel. That undercounts, this interface takes an earlier
+    # channel's name, and udev refuses with "File exists".
+    if [ "$total" -gt 0 ] && [ "$seen" -eq "$total" ] && [ "$total" -eq "$previous" ]; then
+        channel="$lower"
+        break
+    fi
+
+    previous="$total"
+    attempt=$((attempt + 1))
+    sleep 0.025
+done
+
+[ -n "$channel" ] || exit 1
+
+case "$channel" in
+    0) printf 'mb_can1\n' ;;
+    1) printf 'mb_can2\n' ;;
+    2) printf 'mb_can3\n' ;;
+    *) exit 1 ;;   # more channels than this firmware has: leave the name alone
+esac

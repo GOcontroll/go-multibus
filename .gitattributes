@@ -1,0 +1,5 @@
+# Everything here is deployed to a Linux controller: shell scripts, Python
+# entry points, systemd units and udev rules. A CRLF checkout breaks all four -
+# the kernel refuses a `#!/bin/sh\r` shebang, and udev takes the \r as part of
+# the rule. Keep line endings LF regardless of the platform doing the checkout.
+* text=auto eol=lf

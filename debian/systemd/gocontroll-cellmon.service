@@ -1,0 +1,23 @@
+[Unit]
+Description=GOcontroll Multibus cell voltage publisher
+Documentation=file:/usr/share/doc/gocontroll/gocontroll-cellmon.md
+# The module is a USB device, so wait for udev to have settled the ttyACM nodes.
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gocontroll-cellmon serve --quiet --interval 0.5
+# The service finds the module itself and keeps retrying while it is missing,
+# so a restart is only needed if the process itself dies.
+Restart=always
+RestartSec=5
+
+# Nothing is written outside /dev/shm.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Talk to a GOcontroll module over the controller's module bus (SPI).
+
+Two things this is useful for while bringing up a module:
+
+  probe   replay the handshake go-modules uses to identify a module and print
+          the raw reply, which tells you whether the module answers at all and
+          whether the byte alignment is right.
+  start   tell the bootloader its firmware is current so it hands over to the
+          application. `go-modules scan` does not do this, and `go-modules
+          update` bails out before sending it when no firmware file matches, so
+          without this a freshly SWD-flashed module just sits in the bootloader.
+  interfaces
+          read, or with an argument write, the interface configuration of a
+          running application. This is the SPI route that lets the controller
+          configure the module before USB comes up.
+
+Everything is done with raw ioctls so no python3-spidev is needed on the
+controller.
+
+  usage: gocontroll-modulebus.py <probe|start> <slot>
+         gocontroll-modulebus.py interfaces <slot> [m1,m2,m3,m4,m5]
+"""
+import ctypes
+import fcntl
+import struct
+import sys
+import time
+
+# The bootloader exchanges fixed 46-byte messages; the controller clocks one
+# extra byte. Keep both in step with BOOTMESSAGE_LENGTH in go-modules and
+# MESSAGELENGTH in the bootloader.
+BOOTMESSAGE_LENGTH = 46
+BUF_LEN = BOOTMESSAGE_LENGTH + 1
+
+# Message identifiers, carried in both byte 0 and byte 2 of every message.
+MSG_IDENTIFY = 9   # controller asks who you are / module answers with its IDs
+MSG_UP_TO_DATE = 19  # controller says firmware is current -> start application
+
+# Application-level messages, served by ModuleBus.c once the application runs.
+# They start at 100 so they can never collide with a bootloader message.
+MSG_IF_GET = 100   # -> five interface mode bytes
+MSG_IF_SET = 101   # <- five interface mode bytes
+MSG_STATUS = 102   # -> role, link state, cell count
+
+SPI_IOC_WR_MODE = 0x40016B01
+SPI_IOC_WR_BITS_PER_WORD = 0x40016B03
+SPI_IOC_WR_MAX_SPEED_HZ = 0x40046B04
+SPI_IOC_MESSAGE_1 = 0x40206B00  # _IOW('k', 0, struct spi_ioc_transfer[1])
+
+SPI_SPEED_HZ = 2_000_000
+
+# Slot -> spidev, mirroring the Moduline IV mapping in go-modules. Other
+# controller types use a different layout; add them here when needed.
+SLOT_SPIDEV = {
+    1: "/dev/spidev1.0",
+    2: "/dev/spidev1.1",
+    3: "/dev/spidev2.0",
+    4: "/dev/spidev2.1",
+    5: "/dev/spidev2.2",
+    6: "/dev/spidev2.3",
+    7: "/dev/spidev0.0",
+    8: "/dev/spidev0.1",
+}
+
+
+def checksum(buf, length):
+    """Running 8-bit sum over the first `length` bytes, as the bootloader does."""
+    return sum(buf[:length]) & 0xFF
+
+
+def build_message(message_id, payload=b""):
+    """A complete module-bus message: id in byte 0 and 2, length, checksum.
+
+    Payload bytes start at offset 3, which is where the application's messages
+    carry their arguments.
+    """
+    msg = bytearray(BUF_LEN)
+    msg[0] = message_id
+    msg[1] = BOOTMESSAGE_LENGTH - 1
+    msg[2] = message_id
+    msg[3:3 + len(payload)] = payload
+    msg[BOOTMESSAGE_LENGTH - 1] = checksum(msg, BOOTMESSAGE_LENGTH - 1)
+    return msg
+
+
+def message_valid(reply, message_id=None):
+    """Whether a reply is well formed, and optionally of the expected type."""
+    if len(reply) < BOOTMESSAGE_LENGTH:
+        return False
+    if checksum(reply, BOOTMESSAGE_LENGTH - 1) != reply[BOOTMESSAGE_LENGTH - 1]:
+        return False
+    if reply[0] != reply[2]:
+        return False
+    return message_id is None or reply[0] == message_id
+
+
+def reset_module(slot, asserted):
+    """Drive the slot's reset line. Active high via the leds interface."""
+    with open(f"/sys/class/leds/ResetM-{slot}/brightness", "w") as handle:
+        handle.write("255" if asserted else "0")
+
+
+def open_spidev(path):
+    handle = open(path, "rb+", buffering=0)
+    fcntl.ioctl(handle, SPI_IOC_WR_MODE, struct.pack("=B", 0))  # SPI mode 0
+    fcntl.ioctl(handle, SPI_IOC_WR_BITS_PER_WORD, struct.pack("=B", 8))
+    fcntl.ioctl(handle, SPI_IOC_WR_MAX_SPEED_HZ, struct.pack("=I", SPI_SPEED_HZ))
+    return handle
+
+
+def transfer(handle, tx):
+    """Full-duplex transfer of len(tx) bytes; returns what the module sent back."""
+    txbuf = ctypes.create_string_buffer(bytes(tx), len(tx))
+    rxbuf = ctypes.create_string_buffer(len(tx))
+    msg = struct.pack(
+        "=QQIIHBBBBBB",
+        ctypes.addressof(txbuf),
+        ctypes.addressof(rxbuf),
+        len(tx),
+        SPI_SPEED_HZ,
+        0,     # delay_usecs
+        8,     # bits_per_word
+        0,     # cs_change
+        0, 0,  # tx_nbits, rx_nbits
+        0, 0,  # word_delay_usecs, pad
+    )
+    fcntl.ioctl(handle, SPI_IOC_MESSAGE_1, msg)
+    return bytes(rxbuf.raw)
+
+
+def pulse_reset(slot):
+    """Reset the module and give the bootloader time to come up and arm SPI."""
+    reset_module(slot, True)
+    time.sleep(0.2)
+    reset_module(slot, False)
+    time.sleep(0.2)
+
+
+def identify(handle):
+    """Send the identify message and return the reply, or None if invalid."""
+    reply = transfer(handle, build_message(MSG_IDENTIFY))
+    valid = (
+        checksum(reply, BOOTMESSAGE_LENGTH - 1) == reply[BOOTMESSAGE_LENGTH - 1]
+        and (reply[0] == MSG_IDENTIFY or reply[2] == MSG_IDENTIFY)
+    )
+    return reply if valid else None
+
+
+def cmd_probe(slot, handle):
+    pulse_reset(slot)
+    reply = transfer(handle, build_message(MSG_IDENTIFY))
+
+    print("rx:", reply.hex(" "))
+    calculated = checksum(reply, BOOTMESSAGE_LENGTH - 1)
+    carried = reply[BOOTMESSAGE_LENGTH - 1]
+    print(f"checksum: calculated {calculated:#04x}, carried {carried:#04x} -> "
+          f"{'OK' if calculated == carried else 'MISMATCH'}")
+
+    if calculated == carried and (reply[0] == MSG_IDENTIFY or reply[2] == MSG_IDENTIFY):
+        print(f"hardware {reply[6]}-{reply[7]}-{reply[8]}-{reply[9]}, "
+              f"software {reply[10]}.{reply[11]}.{reply[12]}")
+        return 0
+
+    if not any(reply):
+        print("reply is all zeroes: MISO was never driven. Either the module is "
+              "running an application that does not serve the module bus, or it "
+              "is not running at all.")
+    else:
+        print("reply is malformed. A reply that looks right but sits one byte "
+              "late means the module clocked out a stale byte before its "
+              "message.")
+    return 1
+
+
+def cmd_start(slot, handle):
+    """Hand over from the bootloader to the application."""
+    pulse_reset(slot)
+
+    if identify(handle) is None:
+        print(f"slot {slot}: no bootloader reply, cannot start the application")
+        return 1
+
+    # The bootloader jumps as soon as it accepts this message, so there is no
+    # meaningful reply to wait for here.
+    transfer(handle, build_message(MSG_UP_TO_DATE))
+    print(f"slot {slot}: told the bootloader to start the application")
+    return 0
+
+
+def request(handle, message_id, payload=b"", attempts=5, delay=0.05):
+    """Send an application message and return its reply.
+
+    SPI is full duplex, so the module cannot answer in the same transfer that
+    carries the request - it only learns what was asked once the last byte has
+    been clocked in. The reply therefore goes out with the *next* transfer, and
+    this sends the same message repeatedly until the matching reply comes back.
+    Repeating is safe: every application message is idempotent.
+    """
+    message = build_message(message_id, payload)
+    for _ in range(attempts):
+        reply = transfer(handle, message)
+        if message_valid(reply, message_id):
+            return reply
+        time.sleep(delay)
+    return None
+
+
+def cmd_interfaces(slot, handle, modes=None):
+    """Read or write the interface configuration of a running application."""
+    if modes is None:
+        reply = request(handle, MSG_IF_GET)
+        if reply is None:
+            print(f"slot {slot}: no answer to IF_GET. Is the application running?")
+            return 1
+        print("interfaces:", " ".join(str(value) for value in reply[3:8]))
+        return 0
+
+    reply = request(handle, MSG_IF_SET, bytes(modes))
+    if reply is None:
+        print(f"slot {slot}: no answer to IF_SET. Is the application running?")
+        return 1
+
+    if reply[3] != 0:
+        print("the module refused that combination; it kept:",
+              " ".join(str(value) for value in reply[4:9]))
+        return 1
+
+    print("interfaces:", " ".join(str(value) for value in reply[4:9]))
+    return 0
+
+
+def main():
+    if len(sys.argv) < 3 or sys.argv[1] not in ("probe", "start", "interfaces"):
+        print(__doc__)
+        return 2
+
+    command = sys.argv[1]
+    slot = int(sys.argv[2])
+    if slot not in SLOT_SPIDEV:
+        print(f"slot must be one of {sorted(SLOT_SPIDEV)}")
+        return 2
+
+    handle = open_spidev(SLOT_SPIDEV[slot])
+
+    if command == "probe":
+        return cmd_probe(slot, handle)
+    if command == "start":
+        return cmd_start(slot, handle)
+
+    modes = None
+    if len(sys.argv) > 3:
+        modes = [int(value) for value in sys.argv[3].split(",")]
+        if len(modes) != 5:
+            print("give five mode numbers, for example: 1,2,1,2,4")
+            return 2
+    return cmd_interfaces(slot, handle, modes)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

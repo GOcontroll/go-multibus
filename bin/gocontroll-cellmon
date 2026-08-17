@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""Read battery cell voltages from a GOcontroll Multibus module.
+
+The module sits in a controller slot, talks isoSPI to the battery over its
+LTC6820, and hands the result to Linux over USB. This script is both the
+command line tool you reach for while bringing the chain up, and the service
+that publishes the measurements for other software on the controller.
+
+  gocontroll-cellmon.py list                 which Multibus ports are present
+  gocontroll-cellmon.py info                 identity, role and capabilities
+  gocontroll-cellmon.py status               isoSPI link counters
+  gocontroll-cellmon.py interfaces           connector interface configuration
+  gocontroll-cellmon.py interfaces --set can,rs485,can,rs485,isospi
+  gocontroll-cellmon.py cells                one snapshot, human readable
+  gocontroll-cellmon.py watch                keep printing snapshots
+  gocontroll-cellmon.py config --cells 12 --poll 100
+  gocontroll-cellmon.py sim --cell 3 --mv 3300     on a simulator build
+  gocontroll-cellmon.py raw 03 60 f4 6c            raw isoSPI transfer
+  gocontroll-cellmon.py serve                publish to /dev/shm
+
+`serve` writes one JSON document and replaces it atomically on every poll, so a
+reader either sees the previous measurement or the new one, never half of
+either. See Documentation/gocontroll-cellmon.md for the full description.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from typing import Optional
+
+# Find the shared modules whether this runs from a checkout or from a package.
+# Later inserts win, so the checkout's lib/ takes precedence over an installed
+# copy - which is what you want while developing on a controller that also has
+# the package installed.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _candidate in ("/usr/lib/gocontroll-multibus",
+                   _HERE,
+                   os.path.join(os.path.dirname(_HERE), "lib")):
+    if os.path.isdir(_candidate):
+        sys.path.insert(0, _candidate)
+
+from gocontroll_multibus import (  # noqa: E402
+    CAN_CHANNEL_INTERFACE,
+    MODE_NAMES,
+    MODE_VALUES,
+    CellSnapshot,
+    InterfaceConfig,
+    MultibusError,
+    MultibusLink,
+    MultibusStatusError,
+    enumerate_can_interfaces,
+    enumerate_ports,
+)
+
+DEFAULT_OUTPUT = "/dev/shm/gocontroll/multibus-cells.json"
+DEFAULT_INTERVAL = 0.5
+
+# Give up on a module that has not answered for this long and start over with a
+# fresh open, which is what recovers after the module was reset or re-plugged.
+RECONNECT_DELAY = 2.0
+
+
+# ── formatting helpers ───────────────────────────────────────────────────────
+
+def describe_flags(snapshot: CellSnapshot) -> str:
+    """Everything the flags byte says, in the order it matters."""
+    flags = []
+    flags.append("link ok" if snapshot.link_ok else "LINK DOWN")
+    if snapshot.stale:
+        flags.append("STALE")
+    if snapshot.simulated:
+        flags.append("simulated")
+    if snapshot.undervoltage:
+        flags.append("UNDERVOLTAGE")
+    if snapshot.overvoltage:
+        flags.append("OVERVOLTAGE")
+    return ", ".join(flags)
+
+
+def print_snapshot(snapshot: CellSnapshot) -> None:
+    print("sequence %d, %d ms old, %s"
+          % (snapshot.sequence, snapshot.age_ms, describe_flags(snapshot)))
+
+    if not snapshot.cells_100uv:
+        print("no cell data")
+        return
+
+    voltages = snapshot.cells_v
+    lowest = min(range(len(voltages)), key=lambda i: voltages[i])
+    highest = max(range(len(voltages)), key=lambda i: voltages[i])
+
+    for index, volts in enumerate(voltages):
+        marker = ""
+        if index == lowest:
+            marker = "  <- lowest"
+        elif index == highest:
+            marker = "  <- highest"
+        print("  cell %2d  %.4f V%s" % (index + 1, volts, marker))
+
+    print("pack %.3f V, spread %.4f V" % (snapshot.pack_v, snapshot.spread_v))
+
+    if snapshot.temperatures_c:
+        print("temperatures: " +
+              ", ".join("%.1f C" % value for value in snapshot.temperatures_c))
+
+
+def snapshot_to_dict(snapshot: CellSnapshot, link, device: str) -> dict:
+    """The document `serve` publishes.
+
+    Voltages appear twice on purpose: `cells_v` for anything that displays them,
+    `cells_100uv` for anything that wants the raw device values back without a
+    rounding step in between.
+    """
+    voltages = snapshot.cells_v
+    return {
+        "schema": 1,
+        "timestamp": time.time(),
+        "source": {
+            "device": device,
+            "role": "master",
+        },
+        "valid": snapshot.link_ok and not snapshot.stale,
+        "link_ok": snapshot.link_ok,
+        "stale": snapshot.stale,
+        "simulated": snapshot.simulated,
+        "sequence": snapshot.sequence,
+        "age_ms": snapshot.age_ms,
+        "cell_count": len(voltages),
+        "cells_v": [round(value, 4) for value in voltages],
+        "cells_100uv": snapshot.cells_100uv,
+        "pack_v": round(snapshot.pack_v, 3),
+        "min_v": round(min(voltages), 4) if voltages else None,
+        "max_v": round(max(voltages), 4) if voltages else None,
+        "spread_v": round(snapshot.spread_v, 4),
+        "temperatures_c": [round(value, 1) for value in snapshot.temperatures_c],
+        "alarms": {
+            "undervoltage": snapshot.undervoltage,
+            "overvoltage": snapshot.overvoltage,
+        },
+        "link": {
+            "poll_ms": link.poll_ms,
+            "tx_frames": link.tx_frames,
+            "rx_frames": link.rx_frames,
+            "crc_errors": link.crc_errors,
+            "spi_errors": link.spi_errors,
+            "resyncs": link.resyncs,
+            "last_rx_age_ms": link.last_rx_age_ms,
+        },
+    }
+
+
+def write_atomic(path: str, document: dict) -> None:
+    """Replace `path` in one step so a reader never sees a partial document."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    temporary = path + ".tmp"
+    with open(temporary, "w") as handle:
+        json.dump(document, handle, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+def cmd_list(_args) -> int:
+    ports = enumerate_ports()
+    if not ports:
+        print("no Multibus module found")
+        return 1
+
+    for entry in ports:
+        if entry["is_protocol_port"]:
+            role = "module protocol (isoSPI, configuration)"
+        elif entry["connector_interface"]:
+            role = "serial bridge for connector interface %d" % entry["connector_interface"]
+        else:
+            role = "unknown"
+        print("%-14s usb interface %d  %s" % (entry["device"], entry["usb_interface"], role))
+
+    # The CAN interfaces are worth showing here too, because their names are not
+    # can0..can2: a Moduline's own mcp251x controllers take the low numbers.
+    interfaces = enumerate_can_interfaces()
+    for channel, name in enumerate(interfaces):
+        connector = CAN_CHANNEL_INTERFACE.get(channel)
+        print("%-14s gs_usb channel %d  CAN %d, connector interface %s"
+              % (name, channel, channel + 1, connector if connector else "?"))
+    if not interfaces:
+        print("no gs_usb CAN interfaces; is the gs_usb module loaded?")
+
+    return 0
+
+
+def cmd_info(args) -> int:
+    with MultibusLink.open(args.device) as link:
+        info = link.info()
+        print("protocol version : %d" % info.protocol_version)
+        print("role             : %s" % info.role_name)
+        print("hardware         : %s" % info.hardware_name)
+        print("software         : %s" % info.software_name)
+        print("interfaces       : %d" % info.interface_count)
+        print("protocol port    : CDC port %d" % info.protocol_port)
+        print("max cells        : %d" % info.max_cells)
+        print("max temperatures : %d" % info.max_temperatures)
+        print("max raw transfer : %d bytes" % info.max_transfer)
+    return 0
+
+
+def cmd_status(args) -> int:
+    with MultibusLink.open(args.device) as link:
+        status = link.link_status()
+        print("link             : %s" % ("up" if status.link_ok else "down"))
+        print("poll interval    : %d ms" % status.poll_ms)
+        print("last valid frame : %d ms ago" % status.last_rx_age_ms)
+        print("transactions     : %d sent, %d received" % (status.tx_frames, status.rx_frames))
+        print("crc errors       : %d" % status.crc_errors)
+        print("spi errors       : %d" % status.spi_errors)
+        print("resyncs          : %d" % status.resyncs)
+    return 0
+
+
+def cmd_interfaces(args) -> int:
+    with MultibusLink.open(args.device) as link:
+        if args.set:
+            names = [name.strip().lower() for name in args.set.split(",")]
+            if len(names) != 5:
+                print("give five modes, one per connector interface, for example:")
+                print("  --set can,rs485,can,rs485,isospi")
+                return 2
+            try:
+                modes = [MODE_VALUES[name] for name in names]
+            except KeyError as unknown:
+                print("unknown mode %s; pick from %s"
+                      % (unknown, ", ".join(sorted(MODE_VALUES))))
+                return 2
+
+            config = link.set_interfaces(modes)
+            if config.modes != modes:
+                print("the module refused that combination and kept:")
+                _print_interfaces(config)
+                return 1
+        else:
+            config = link.get_interfaces()
+
+        _print_interfaces(config)
+    return 0
+
+
+def _print_interfaces(config: InterfaceConfig) -> None:
+    pins = {1: "6/5", 2: "12/13", 3: "18/19", 4: "24/25", 5: "isoSPI"}
+    for interface in range(1, 6):
+        allowed = "/".join(MODE_NAMES[mode]
+                           for mode in InterfaceConfig.ALLOWED[interface])
+        print("interface %d  pins %-6s  %-7s (can be %s)"
+              % (interface, pins[interface], config.name_of(interface), allowed))
+
+
+def cmd_cells(args) -> int:
+    with MultibusLink.open(args.device) as link:
+        snapshot = link.read_cells()
+        if args.json:
+            print(json.dumps(snapshot_to_dict(snapshot, link.link_status(),
+                                              link.device), indent=2))
+        else:
+            print_snapshot(snapshot)
+    return 0
+
+
+def cmd_watch(args) -> int:
+    with MultibusLink.open(args.device) as link:
+        try:
+            while True:
+                snapshot = link.read_cells()
+                voltages = snapshot.cells_v
+                print("%s  seq %-6d %-30s %s"
+                      % (time.strftime("%H:%M:%S"), snapshot.sequence,
+                         describe_flags(snapshot),
+                         " ".join("%.4f" % value for value in voltages)))
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            pass
+    return 0
+
+
+def cmd_config(args) -> int:
+    with MultibusLink.open(args.device) as link:
+        link.configure_cells(args.cells, args.poll)
+        print("expecting %d cells, polling every %d ms" % (args.cells, args.poll))
+    return 0
+
+
+def cmd_sim(args) -> int:
+    with MultibusLink.open(args.device) as link:
+        link.simulate_cell(args.cell - 1, args.mv)
+        print("cell %d pinned at %.1f mV" % (args.cell, args.mv))
+    return 0
+
+
+def cmd_raw(args) -> int:
+    try:
+        payload = bytes(int(token, 16) for token in args.bytes)
+    except ValueError:
+        print("give the bytes as hex, for example: raw 03 60 f4 6c")
+        return 2
+
+    with MultibusLink.open(args.device) as link:
+        answer = link.isospi_transfer(payload)
+        print("sent    :", " ".join("%02x" % value for value in payload))
+        print("received:", " ".join("%02x" % value for value in answer))
+    return 0
+
+
+def cmd_serve(args) -> int:
+    """Publish snapshots to /dev/shm until interrupted.
+
+    Everything that can go wrong here is transient: the module can be reset, the
+    controller can re-enumerate USB, a poll can time out. None of that should
+    stop the service, so failures are counted, reported in the document, and
+    retried.
+    """
+    link: Optional[MultibusLink] = None
+    failures = 0
+    last_error = ""
+
+    try:
+        while True:
+            started = time.monotonic()
+
+            try:
+                if link is None:
+                    link = MultibusLink.open(args.device)
+                    if not args.quiet:
+                        print("connected to %s" % link.device, flush=True)
+
+                snapshot = link.read_cells()
+                document = snapshot_to_dict(snapshot, link.link_status(), link.device)
+                document["errors"] = {"read_failures": failures, "last_error": last_error}
+                write_atomic(args.output, document)
+                failures = 0
+                last_error = ""
+
+            except (MultibusError, OSError) as error:
+                failures += 1
+                last_error = str(error)
+                if not args.quiet:
+                    print("poll failed: %s" % error, file=sys.stderr, flush=True)
+
+                if link is not None:
+                    link.close()
+                    link = None
+
+                # Publish the failure too: a reader that only ever sees a stale
+                # file cannot tell a dead service from a dead battery link.
+                write_atomic(args.output, {
+                    "schema": 1,
+                    "timestamp": time.time(),
+                    "valid": False,
+                    "link_ok": False,
+                    "errors": {"read_failures": failures, "last_error": last_error},
+                })
+                time.sleep(RECONNECT_DELAY)
+                continue
+
+            if args.once:
+                return 0
+
+            remaining = args.interval - (time.monotonic() - started)
+            if remaining > 0:
+                time.sleep(remaining)
+
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if link is not None:
+            link.close()
+
+
+# ── entry point ──────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__.split("\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    parser.add_argument("-d", "--device",
+                        help="protocol port to use; found automatically when omitted")
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("list", help="show the Multibus ports on this controller")
+    subparsers.add_parser("info", help="identity, role and capabilities")
+    subparsers.add_parser("status", help="isoSPI link counters")
+
+    interfaces = subparsers.add_parser("interfaces", help="connector interface configuration")
+    interfaces.add_argument("--set", metavar="M1,M2,M3,M4,M5",
+                            help="apply a configuration, one mode per interface")
+
+    cells = subparsers.add_parser("cells", help="read one cell snapshot")
+    cells.add_argument("--json", action="store_true", help="print the published document")
+
+    watch = subparsers.add_parser("watch", help="keep printing snapshots")
+    watch.add_argument("-i", "--interval", type=float, default=1.0,
+                       help="seconds between reads (default 1.0)")
+
+    config = subparsers.add_parser("config", help="set cell count and poll interval")
+    config.add_argument("--cells", type=int, required=True, help="number of cells, 1..24")
+    config.add_argument("--poll", type=int, required=True,
+                        help="isoSPI poll interval in ms, 100..10000")
+
+    sim = subparsers.add_parser("sim", help="pin a simulated cell (simulator build only)")
+    sim.add_argument("--cell", type=int, required=True, help="cell number, starting at 1")
+    sim.add_argument("--mv", type=float, required=True, help="voltage in mV")
+
+    raw = subparsers.add_parser("raw", help="raw isoSPI transfer, bytes in hex")
+    raw.add_argument("bytes", nargs="+", metavar="HEX")
+
+    serve = subparsers.add_parser("serve", help="publish snapshots to /dev/shm")
+    serve.add_argument("-o", "--output", default=DEFAULT_OUTPUT,
+                       help="output file (default %s)" % DEFAULT_OUTPUT)
+    serve.add_argument("-i", "--interval", type=float, default=DEFAULT_INTERVAL,
+                       help="seconds between polls (default %.1f)" % DEFAULT_INTERVAL)
+    serve.add_argument("--once", action="store_true", help="publish once and exit")
+    serve.add_argument("-q", "--quiet", action="store_true", help="no progress on stderr")
+
+    return parser
+
+
+HANDLERS = {
+    "list": cmd_list,
+    "info": cmd_info,
+    "status": cmd_status,
+    "interfaces": cmd_interfaces,
+    "cells": cmd_cells,
+    "watch": cmd_watch,
+    "config": cmd_config,
+    "sim": cmd_sim,
+    "raw": cmd_raw,
+    "serve": cmd_serve,
+}
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 2
+
+    try:
+        return HANDLERS[args.command](args)
+    except MultibusStatusError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except MultibusError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except OSError as error:
+        print("%s" % error, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

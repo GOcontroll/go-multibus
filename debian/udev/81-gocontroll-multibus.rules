@@ -1,0 +1,51 @@
+# Deterministic names for the GOcontroll Multibus module.
+#
+# Without this the module's CAN interfaces are named by the kernel in discovery
+# order, so they land on can4..can6 on a Moduline IV (four onboard mcp251x
+# controllers) but on can2..can4 on an M1 (two). Naming them here makes them
+# mb_can1..mb_can3 on every controller.
+#
+# The numbering follows the knowledge base - CAN 1..3 and RS485 1..3 - which is
+# NOT the connector interface numbering used inside the firmware:
+#
+#   name         knowledge base   connector interface   USB interface
+#   mb_can1      CAN 1            1                     -
+#   mb_can2      CAN 2            3                     -
+#   mb_can3      CAN 3            4                     -
+#   mb_serial1   RS485 1 / RS232  2                     01
+#   mb_serial2   RS485 2          3                     03
+#   mb_serial3   RS485 3          4                     05
+#
+# mb_can2 and mb_serial2 are the same connector pins in different modes, as are
+# mb_can3 and mb_serial3. Only one of each pair can be live at a time.
+#
+# Runs at 81, after 80-can-usb.rules, so it has the last word on the name.
+
+# --- CAN interfaces -----------------------------------------------------------
+# The helper works out which channel this netdev is and prints the name.
+SUBSYSTEM=="net", ACTION=="add", SUBSYSTEMS=="usb", \
+    ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", \
+    PROGRAM="/lib/udev/gocontroll-multibus-canname %k", NAME="%c"
+
+# --- Serial ports -------------------------------------------------------------
+# The USB interface number is fixed by the firmware descriptor, so it maps
+# straight onto the connector interface. Symlinks rather than renames: the
+# ttyACM node keeps its kernel name and cdc_acm stays happy.
+#
+# Matching is on ENV and not on ATTRS. udev requires every ATTRS in one rule to
+# match the *same* parent device, and idVendor lives on the USB device while
+# bInterfaceNumber lives on the USB interface - two different parents, so such a
+# rule silently never matches. The ID_* properties below are all set on the tty
+# device itself by the usb_id builtin that 60-serial.rules runs, so they can be
+# combined freely.
+SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
+    ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="mb_serial1"
+SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
+    ENV{ID_USB_INTERFACE_NUM}=="03", SYMLINK+="mb_serial2"
+SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
+    ENV{ID_USB_INTERFACE_NUM}=="05", SYMLINK+="mb_serial3"
+
+# Interface 7 is the module protocol, not a serial bridge. /dev/mb_protocol is
+# what the service and the tooling open.
+SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
+    ENV{ID_USB_INTERFACE_NUM}=="07", SYMLINK+="mb_protocol"
