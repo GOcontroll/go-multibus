@@ -529,6 +529,12 @@ class MultibusLink:
         with the descriptor already gone from its table. That is easy to hit here:
         a request that timed out on write did so precisely because the buffer was
         full, and closing straight afterwards would hang on those same bytes.
+
+        Catching Exception rather than OSError is deliberate: termios.error does
+        not derive from OSError, so `except OSError` lets it through. On a port
+        whose USB device has just gone away tcflush raises exactly that - EIO
+        wrapped in a termios.error - and it escaped all the way out of the
+        daemon, which died instead of recovering from a reset module.
         """
         fd, self._fd = self._fd, -1
         if fd < 0:
@@ -537,11 +543,11 @@ class MultibusLink:
         if termios is not None:
             try:
                 termios.tcflush(fd, termios.TCIOFLUSH)
-            except OSError:
+            except Exception:
                 pass
         try:
             os.close(fd)
-        except OSError:
+        except Exception:
             pass
 
     # -- tty plumbing --------------------------------------------------------

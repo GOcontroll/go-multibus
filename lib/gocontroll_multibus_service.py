@@ -543,10 +543,20 @@ class ModuleSupervisor:
                 return
             getattr(self, handler)()
 
-        except (MultibusError, OSError, subprocess.SubprocessError) as error:
+        # Exception rather than a tuple of the expected ones. This loop exists to
+        # keep a module alive across anything that goes wrong with it, and the
+        # library it drives reaches hardware through several stacks - termios,
+        # spidev ioctls, subprocess, USB - that each raise their own types.
+        # termios.error already got through a narrower clause once and killed the
+        # daemon. Anything unexpected is logged with its type and retried, which
+        # beats exiting; KeyboardInterrupt and SystemExit are BaseException and
+        # still pass straight through.
+        except Exception as error:
             self.failures += 1
-            self.last_error = str(error)
-            self.log("%s failed: %s" % (self.state, error))
+            # The type matters when the error is one we did not anticipate:
+            # "failed: (5, 'Input/output error')" alone does not say what raised.
+            self.last_error = "%s: %s" % (type(error).__name__, error)
+            self.log("%s failed: %s" % (self.state, self.last_error))
 
             now = time.monotonic()
             if self._failing_since is None:
