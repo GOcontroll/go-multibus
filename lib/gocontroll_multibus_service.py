@@ -374,8 +374,26 @@ class ModuleSupervisor:
         while not os.path.exists(PROTOCOL_SYMLINK) and time.monotonic() < settle:
             time.sleep(0.1)
 
-        self.link = MultibusLink.open(timeout=self.link_timeout,
-                                      retries=self.link_retries)
+        # Opening is part of the wait, not a step after it. Right after the
+        # module is reset the device nodes from before the reset can still be
+        # around for a moment: the name exists, but opening it gives ENODEV
+        # because the USB device behind it is gone. Treating that as a hard
+        # failure threw the whole sequence away and started over - visible at
+        # boot as an "enumerate failed: [Errno 19] No such device" followed by a
+        # second, successful pass. Retrying until the deadline rides it out.
+        self.link = None
+        while True:
+            try:
+                self.link = MultibusLink.open(timeout=self.link_timeout,
+                                              retries=self.link_retries)
+                break
+            except (MultibusError, OSError) as failure:
+                if time.monotonic() >= deadline:
+                    raise MultibusError(
+                        "the protocol port did not become usable within %.1fs "
+                        "(%s)" % (self.enumeration_timeout, failure))
+                time.sleep(ENUMERATION_POLL)
+
         self.log("connected to %s" % self.link.device)
 
         # The port existing proves the module enumerated, so a failure from here
