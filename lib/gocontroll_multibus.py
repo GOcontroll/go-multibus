@@ -421,6 +421,19 @@ CAN_INTERFACE_NAMES = ["mb_can1", "mb_can2", "mb_can3"]
 #: Connector interface each gs_usb channel sits on, for reporting.
 CAN_CHANNEL_INTERFACE = {0: 1, 1: 3, 2: 4}
 
+#: Where the naming rule can be installed. Its presence means the kernel names
+#: are temporary - udev is about to replace them - so they must not be used.
+UDEV_RULE_PATHS = (
+    "/etc/udev/rules.d/81-gocontroll-multibus.rules",
+    "/usr/lib/udev/rules.d/81-gocontroll-multibus.rules",
+    "/lib/udev/rules.d/81-gocontroll-multibus.rules",
+)
+
+
+def udev_names_expected() -> bool:
+    """Whether the naming rule is installed, so mb_canN names should appear."""
+    return any(os.path.exists(path) for path in UDEV_RULE_PATHS)
+
 
 def enumerate_can_interfaces(settle: float = 0.0) -> List[str]:
     """The Linux CAN interfaces of a Multibus module, in gs_usb channel order.
@@ -450,6 +463,14 @@ def enumerate_can_interfaces(settle: float = 0.0) -> List[str]:
         if time.monotonic() >= deadline:
             break
         time.sleep(0.1)
+
+    # With the rule installed, hand back only what udev has actually named -
+    # never the kernel names. They are about to be replaced, and acting on one
+    # is worse than doing nothing: `ip link set can4 up` fails once udev has
+    # renamed it, and if it does succeed the rename is then blocked for good,
+    # because an interface cannot be renamed while it is up.
+    if udev_names_expected():
+        return named
 
     found = []
     for sys_net in glob.glob("/sys/class/net/*"):

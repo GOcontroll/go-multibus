@@ -455,7 +455,14 @@ class ModuleSupervisor:
         two tools disagree: go-can would keep reporting its stored value while
         the interface actually ran at ours.
         """
-        # Give udev a moment to finish renaming; see enumerate_can_interfaces.
+        # Wait for udev's queue to drain before looking. Polling for the names
+        # races with the renames; this waits for the events themselves.
+        try:
+            subprocess.run(["udevadm", "settle", "--timeout=5"],
+                           capture_output=True, timeout=10)
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass          # best effort; the poll below still covers it
+
         interfaces = enumerate_can_interfaces(settle=UDEV_SETTLE)
         if len(interfaces) < 3:
             self.log("expected 3 gs_usb interfaces, found %d (%s); not touching CAN"
