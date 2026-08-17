@@ -206,8 +206,8 @@ missing file is itself a working configuration.
 | `cell_count` | How many cells the battery side reports, 1..24. |
 | `module_poll_ms` | How often the module polls the battery over isoSPI. |
 | `publish_interval_s` | How often the service reads the module and rewrites the file. |
-| `bring_up_can` | Whether the service runs `ip link set canX up`. |
-| `can_bitrate` | Bit rate for those interfaces. |
+| `bring_up_can` | Whether the service raises the module's CAN interfaces. |
+| `can_bitrate` | Fallback bit rate, used only when go-can cannot configure them. |
 | `output` | Where the cell data is published. |
 
 `module_poll_ms` and `publish_interval_s` are independent. The module keeps its
@@ -270,6 +270,13 @@ because the USB descriptor is fixed. The service only brings up the ones with a
 live transceiver: `mb_can1` is always CAN, `mb_can2` and `mb_can3` follow
 connector interfaces 3 and 4. A channel whose interface is RS485 is left down,
 since a netdev that can never carry a frame is worse than no netdev at all.
+
+**The bitrate is go-can's, not ours.** Each interface is raised with
+`go-can apply <iface>`, which reads `/etc/gocontroll/can.d/<iface>.conf`. Setting
+a bitrate here as well would make the two tools disagree - go-can would keep
+reporting its stored value while the interface actually ran at the service's.
+`can_bitrate` in the service config is only a fallback for a controller where
+go-can is not installed, or has no config for the interface yet.
 
 ## Bitrates: go-can, not go-multibus
 

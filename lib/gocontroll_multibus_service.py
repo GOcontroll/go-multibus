@@ -103,6 +103,8 @@ class Config:
     module_poll_ms: int = 100
     publish_interval_s: float = 0.5
     bring_up_can: bool = True
+    # Fallback only. Bus parameters belong to go-can; this is used solely when
+    # go-can is not installed or has no config for the interface yet.
     can_bitrate: int = 500000
     output: str = OUTPUT_PATH
 
@@ -427,6 +429,13 @@ class ModuleSupervisor:
         The names are looked up rather than assumed: a Moduline has its own
         mcp251x controllers on can0..can3, so the module's channels land on
         can4..can6. Guessing "can0" would reconfigure the controller's own bus.
+
+        The bus parameters are go-can's to decide, not ours - it is the canonical
+        CAN configuration tool on these controllers and keeps them in
+        /etc/gocontroll/can.d/. So the interface is handed to `go-can apply`,
+        which reads that config. Setting a bitrate here as well would make the
+        two tools disagree: go-can would keep reporting its stored value while
+        the interface actually ran at ours.
         """
         # Give udev a moment to finish renaming; see enumerate_can_interfaces.
         interfaces = enumerate_can_interfaces(settle=UDEV_SETTLE)
@@ -437,17 +446,43 @@ class ModuleSupervisor:
 
         for channel in self.config.can_channels:
             name = interfaces[channel]
-            try:
-                subprocess.run(["ip", "link", "set", name, "down"],
-                               check=False, capture_output=True)
-                subprocess.run(["ip", "link", "set", name, "up", "type", "can",
-                                "bitrate", str(self.config.can_bitrate)],
-                               check=True, capture_output=True)
-                self.log("%s up at %d bit/s" % (name, self.config.can_bitrate))
-            except (subprocess.CalledProcessError, FileNotFoundError) as error:
-                # A CAN interface that will not come up is worth reporting but
-                # must not stop the cell data from being published.
-                self.log("could not bring up %s: %s" % (name, error))
+            if self._apply_can_with_go_can(name):
+                continue
+            self._apply_can_with_ip(name)
+
+    def _apply_can_with_go_can(self, name: str) -> bool:
+        """Let go-can configure and raise the interface. False if it could not.
+
+        Fails when go-can is absent, or when it has no config for this interface
+        yet - a fresh controller that has never had a module in it. The caller
+        falls back in both cases.
+        """
+        try:
+            result = subprocess.run(["go-can", "apply", name],
+                                    capture_output=True, timeout=15)
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            return False
+
+        if result.returncode != 0:
+            return False
+
+        self.log("%s up, configured by go-can" % name)
+        return True
+
+    def _apply_can_with_ip(self, name: str) -> None:
+        """Raise the interface directly, for a controller without go-can."""
+        try:
+            subprocess.run(["ip", "link", "set", name, "down"],
+                           check=False, capture_output=True)
+            subprocess.run(["ip", "link", "set", name, "up", "type", "can",
+                            "bitrate", str(self.config.can_bitrate)],
+                           check=True, capture_output=True)
+            self.log("%s up at %d bit/s (go-can not available)"
+                     % (name, self.config.can_bitrate))
+        except (subprocess.CalledProcessError, FileNotFoundError) as error:
+            # A CAN interface that will not come up is worth reporting but
+            # must not stop the cell data from being published.
+            self.log("could not bring up %s: %s" % (name, error))
 
     def _do_running(self) -> None:
         assert self.link is not None

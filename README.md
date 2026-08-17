@@ -87,6 +87,8 @@ only one of each pair carries traffic.
 
 Bus parameters - bitrate, sample point, FD - belong to `go-can`, the same as for
 the baseboard buses. **go-multibus owns the mode, go-can owns the parameters.**
+The service raises each interface with `go-can apply`, so the two never disagree
+about what a bus is running at.
 
 ## Device names
 
