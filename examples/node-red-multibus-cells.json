@@ -1,0 +1,175 @@
+[
+    {
+        "id": "multibus_cells_tab",
+        "type": "tab",
+        "label": "Multibus cells",
+        "disabled": false,
+        "info": "Reads the cell voltages the go-multibus service publishes to\n/dev/shm and makes them available as a JSON message.\n\nThe service owns the module and writes the file; this flow only reads it,\nso it can run alongside the service without interfering.\n\nThe file is replaced atomically (write to a temporary name, then rename),\nso a read either gets the previous document or the new one in full - never\nhalf of either. No locking or retry is needed here.\n\nCheck `valid` before using the numbers. It is `link_ok && !stale`, so a\nsingle field tells you whether the isoSPI link is delivering fresh data."
+    },
+    {
+        "id": "tick_500ms",
+        "type": "inject",
+        "z": "multibus_cells_tab",
+        "name": "every 500 ms",
+        "props": [],
+        "repeat": "0.5",
+        "crontab": "",
+        "once": true,
+        "onceDelay": "1",
+        "topic": "",
+        "x": 140,
+        "y": 120,
+        "wires": [
+            [
+                "read_cells_file"
+            ]
+        ]
+    },
+    {
+        "id": "read_cells_file",
+        "type": "file in",
+        "z": "multibus_cells_tab",
+        "name": "read multibus-cells.json",
+        "filename": "/dev/shm/gocontroll/multibus-cells.json",
+        "filenameType": "str",
+        "format": "utf8",
+        "chunk": false,
+        "sendError": false,
+        "encoding": "none",
+        "allProps": false,
+        "x": 380,
+        "y": 120,
+        "wires": [
+            [
+                "parse_json"
+            ]
+        ]
+    },
+    {
+        "id": "parse_json",
+        "type": "json",
+        "z": "multibus_cells_tab",
+        "name": "JSON",
+        "property": "payload",
+        "action": "obj",
+        "pretty": false,
+        "x": 590,
+        "y": 120,
+        "wires": [
+            [
+                "check_valid"
+            ]
+        ]
+    },
+    {
+        "id": "check_valid",
+        "type": "switch",
+        "z": "multibus_cells_tab",
+        "name": "valid?",
+        "property": "payload.valid",
+        "propertyType": "msg",
+        "rules": [
+            {
+                "t": "true"
+            },
+            {
+                "t": "else"
+            }
+        ],
+        "checkall": "false",
+        "repair": false,
+        "outputs": 2,
+        "x": 710,
+        "y": 120,
+        "wires": [
+            [
+                "debug_full",
+                "pick_cell_1"
+            ],
+            [
+                "debug_invalid"
+            ]
+        ]
+    },
+    {
+        "id": "debug_full",
+        "type": "debug",
+        "z": "multibus_cells_tab",
+        "name": "cells (full JSON)",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 930,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "pick_cell_1",
+        "type": "function",
+        "z": "multibus_cells_tab",
+        "name": "parse cell 1",
+        "func": "// One signal pulled out as an example of consuming a single value.\n//\n// cells_v is rounded for display; cells_100uv carries the raw device value\n// in the 100 uV steps the LTC681x family uses, so read that when the number\n// is going to be stored or used in arithmetic.\nconst cells = msg.payload.cells_100uv || [];\n\nif (cells.length === 0) {\n    return null;   // nothing reported yet\n}\n\nmsg.topic = \"multibus/cell1\";\nmsg.payload = {\n    volts: cells[0] / 10000,\n    raw_100uv: cells[0],\n    age_ms: msg.payload.age_ms,\n    simulated: msg.payload.simulated === true\n};\n\n// Show the value on the node itself, so the flow is readable at a glance.\nnode.status({ fill: \"green\", shape: \"dot\",\n              text: msg.payload.volts.toFixed(4) + \" V\" });\n\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 920,
+        "y": 160,
+        "wires": [
+            [
+                "debug_cell_1"
+            ]
+        ]
+    },
+    {
+        "id": "debug_cell_1",
+        "type": "debug",
+        "z": "multibus_cells_tab",
+        "name": "cell 1",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1110,
+        "y": 160,
+        "wires": []
+    },
+    {
+        "id": "debug_invalid",
+        "type": "debug",
+        "z": "multibus_cells_tab",
+        "name": "not valid - link down or stale",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 980,
+        "y": 220,
+        "wires": []
+    },
+    {
+        "id": "note",
+        "type": "comment",
+        "z": "multibus_cells_tab",
+        "name": "Requires the go-multibus service to be running",
+        "info": "systemctl enable --now go-multibus\n\nThe service brings the module up, configures its interfaces and polls the\ncell data over USB. Without it the file is absent and the file-in node\nreports an error on every tick.\n\nIf `valid` stays false, check the isoSPI link:\n\n    gocontroll-cellmon status\n\n`tx_frames` climbing while `rx_frames` stays put means the master is\nclocking and nothing is answering.",
+        "x": 250,
+        "y": 60,
+        "wires": []
+    }
+]

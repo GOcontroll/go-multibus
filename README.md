@@ -170,6 +170,12 @@ later. Older images serve the protocol port as a plain RS485 bridge, and the
 tooling says so rather than reporting a vague timeout. Firmware lives in the
 [Module-Multibus](https://github.com/GOcontroll/Module-Multibus) repository.
 
+## Examples
+
+[examples/node-red-multibus-cells.json](examples/node-red-multibus-cells.json)
+reads the published cell voltages every 500 ms and emits them as JSON, with one
+signal parsed out as an example. See [examples/README.md](examples/README.md).
+
 ## Documentation
 
 - [docs/gocontroll-cellmon.md](docs/gocontroll-cellmon.md) - how the cell data
