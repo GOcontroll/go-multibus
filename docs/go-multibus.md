@@ -361,7 +361,7 @@ a dead battery link; this way it can.
 |---------|---------------|
 | stuck in `start` | The module does not answer on the module bus. Either the slot is empty or the reset line does not reach the STM32. |
 | stuck in `configure` | The bootloader handed over but the application does not answer. Most likely an older build without `ModuleBus.c`; apply the configuration over USB instead. |
-| stuck in `enumerate` | The application runs but USB does not come up. Check that the controller port is in host mode. |
+| stuck in `enumerate` | The application runs but USB does not come up. The log says whether the controller's OTG port booted in the wrong role; if it did, `gocontroll-usb-hostmode --apply` and a reboot fix it. Otherwise look at the cable and the module. |
 | `running`, `failures` climbing | USB works but polls fail. `journalctl -u go-multibus` has the error text. |
 | `running` but `valid` false | USB is fine and the isoSPI link is not. Use `gocontroll-cellmon status` on the counters. |
 

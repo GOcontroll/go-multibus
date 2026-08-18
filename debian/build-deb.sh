@@ -69,10 +69,34 @@ case "$1" in
         systemctl enable gocontroll-usb-hostmode.service || true
         systemctl enable go-multibus.service || true
 
+        # Host mode is applied here rather than left to the service on the next
+        # boot. The change lands in the u-boot environment and the Falcon boot
+        # blob, so it only takes effect on the boot *after* the one that writes
+        # it. Left to the service, the first reboot after installing still comes
+        # up in peripheral mode, nothing enumerates, and a second reboot is
+        # needed before the module appears - which reads as a broken package.
+        # Applying it now makes one reboot enough.
+        #
+        # Guarded on the node being readable, which is what excludes a chroot or
+        # image build: there the service applies it on the first real boot, and
+        # that path does still cost a second reboot. Nothing can be done about
+        # that from inside a chroot, where there is no boot environment to write.
+        dr_mode_node=/proc/device-tree/soc@0/bus@32c00000/usb@32e40000/dr_mode
+        if [ -r "$dr_mode_node" ] \
+                && [ "$(tr -d '\0' < "$dr_mode_node")" != host ]; then
+            if /usr/bin/gocontroll-usb-hostmode --apply; then
+                echo "The controller's OTG port has been switched to host mode."
+                echo "This takes effect on the next reboot; until then no"
+                echo "module can enumerate over USB."
+            else
+                echo "WARNING: could not switch the OTG port to host mode." >&2
+                echo "No module will enumerate until this is done. Run" >&2
+                echo "    gocontroll-usb-hostmode --apply" >&2
+            fi
+        fi
+
         echo "go-multibus installed. Start it with:"
         echo "    systemctl start go-multibus"
-        echo "On a controller whose OTG port is still in device mode, host mode"
-        echo "is applied on the next boot."
         ;;
 esac
 POSTINST

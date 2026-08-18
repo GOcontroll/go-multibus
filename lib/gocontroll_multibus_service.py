@@ -83,6 +83,19 @@ ENUMERATION_POLL = 0.2
 # single dropped poll does not trigger a reset.
 FAILURE_GRACE = 3.0
 
+# The device tree node that says which role the controller's OTG port booted in.
+# A Multibus module hangs off that port, so a port that came up as a gadget can
+# never enumerate one however often the module is reset.
+OTG_DR_MODE_PATH = "/proc/device-tree/soc@0/bus@32c00000/usb@32e40000/dr_mode"
+
+# How long to wait before starting the bring-up sequence over, indexed by how
+# many times in a row it has now failed. Without a back-off a controller whose
+# OTG port is still in peripheral mode resets the module every six seconds
+# indefinitely - a hundred resets in seven minutes, measured on a Moduline L4 -
+# which buries the one line that says what is actually wrong under copies of
+# itself. The last entry is the ceiling.
+RETRY_BACKOFF = (0.0, 5.0, 15.0, 30.0, 60.0)
+
 
 class State:
     """The steps of the bring-up sequence, in the order they run."""
@@ -186,6 +199,23 @@ def write_atomic(path: str, document: dict) -> None:
     os.replace(temporary, path)
 
 
+def otg_dr_mode() -> Optional[str]:
+    """The role the controller's OTG port booted in, or None if unknowable.
+
+    None is not an answer, it is the absence of one: the node is missing on a
+    controller with a different device tree, and in any build container. Only an
+    explicit role that is not "host" is evidence of anything, so a caller must
+    treat None as "no opinion" rather than as a fault.
+    """
+    try:
+        with open(OTG_DR_MODE_PATH, "rb") as node:
+            # Device tree strings are NUL-terminated, and the property is read
+            # back with that terminator still on it.
+            return node.read().decode("ascii", "replace").strip("\0 \n")
+    except OSError:
+        return None
+
+
 # ── Module bus helpers ───────────────────────────────────────────────────────
 # Imported lazily: the module bus tool talks to spidev, which only exists on a
 # controller, and the UI must still run on a machine where it does not.
@@ -274,6 +304,10 @@ class ModuleSupervisor:
         self.module_running = False
         self._failing_since: Optional[float] = None
         self._last_publish = 0.0
+        # How many bring-up attempts have failed back to back, and the earliest
+        # moment the next one may start. Both are cleared by reaching RUNNING.
+        self._attempts = 0
+        self._retry_at = 0.0
 
     # -- lifecycle -----------------------------------------------------------
     def close(self) -> None:
@@ -285,9 +319,15 @@ class ModuleSupervisor:
         """Go back to the start of the sequence.
 
         `full` forces a hardware reset even for a supervisor that normally
-        attaches without one; that is what the UI's restart key asks for.
+        attaches without one; that is what the UI's restart key asks for. It
+        also clears any back-off: someone asking for a restart by hand has
+        usually just changed something, and should not be made to wait out a
+        delay earned before they did.
         """
         self.close()
+        if full:
+            self._attempts = 0
+            self._retry_at = 0.0
         self.state = State.RESET if full else self.start_state
         self.module_running = False
         self.snapshot = None
@@ -352,6 +392,25 @@ class ModuleSupervisor:
         self.module_running = True
         self.state = State.ENUMERATE
 
+    def _enumeration_failure(self) -> str:
+        """Why nothing enumerated, naming the OTG port when that is the reason.
+
+        Worth the extra file read at the one moment it is needed: "check that
+        the port is in host mode" sends people looking at cables and modules,
+        while the device tree can state outright that the port booted as a
+        gadget - which no cable, module or reset is going to fix.
+        """
+        mode = otg_dr_mode()
+        if mode is None or mode == "host":
+            return ("the module did not enumerate on USB within %.1fs. Check "
+                    "that the controller USB port is in host mode."
+                    % self.enumeration_timeout)
+        return ("the module did not enumerate on USB within %.1fs because the "
+                "controller's OTG port booted in %s mode, not host. No module "
+                "can enumerate until that is fixed: run "
+                "`gocontroll-usb-hostmode --apply` and reboot."
+                % (self.enumeration_timeout, mode))
+
     def _do_enumerate(self) -> None:
         """Wait for USB, then open the protocol port and apply the cell config."""
         deadline = time.monotonic() + self.enumeration_timeout
@@ -361,10 +420,7 @@ class ModuleSupervisor:
             if any(entry["is_protocol_port"] for entry in ports):
                 break
             if time.monotonic() >= deadline:
-                raise MultibusError(
-                    "the module did not enumerate on USB within %.1fs. Check "
-                    "that the controller USB port is in host mode."
-                    % self.enumeration_timeout)
+                raise MultibusError(self._enumeration_failure())
             time.sleep(ENUMERATION_POLL)
 
         # Same race as the CAN names: the ttyACM nodes exist before udev has
@@ -540,6 +596,12 @@ class ModuleSupervisor:
 
     def step(self) -> None:
         """Advance the state machine by one bounded piece of work."""
+        # Sitting out a back-off after a failed attempt. Returning rather than
+        # sleeping keeps a step non-blocking, which is what lets the UI call
+        # this from its own loop without going deaf to the keyboard.
+        if time.monotonic() < self._retry_at:
+            return
+
         try:
             handler = self.HANDLERS.get(self.state)
             if handler is None:
@@ -549,6 +611,12 @@ class ModuleSupervisor:
                 self.restart()
                 return
             getattr(self, handler)()
+            # Getting as far as RUNNING clears the back-off, so a module that
+            # drops out later is picked up straight away instead of inheriting
+            # the delay earned by some earlier problem.
+            if self.state == State.RUNNING:
+                self._attempts = 0
+                self._retry_at = 0.0
 
         # Exception rather than a tuple of the expected ones. This loop exists to
         # keep a module alive across anything that goes wrong with it, and the
@@ -562,8 +630,15 @@ class ModuleSupervisor:
             self.failures += 1
             # The type matters when the error is one we did not anticipate:
             # "failed: (5, 'Input/output error')" alone does not say what raised.
+            previous_error = self.last_error
             self.last_error = "%s: %s" % (type(error).__name__, error)
-            self.log("%s failed: %s" % (self.state, self.last_error))
+            # Logged once per run of identical failures. A cause that is not
+            # going to clear on its own - an OTG port in the wrong role, an
+            # empty slot - fails the same way every cycle, and repeating it
+            # buries the first and only useful copy. The state file still
+            # carries the current error for anything that polls.
+            if self.last_error != previous_error:
+                self.log("%s failed: %s" % (self.state, self.last_error))
 
             now = time.monotonic()
             if self._failing_since is None:
@@ -597,10 +672,21 @@ class ModuleSupervisor:
                 self.state = State.FAILED
                 return
 
+            self._back_off()
             self.restart()
 
         finally:
             self._publish_state()
+
+    def _back_off(self) -> None:
+        """Hold off the next bring-up attempt, and say so while it is growing."""
+        delay = RETRY_BACKOFF[min(self._attempts, len(RETRY_BACKOFF) - 1)]
+        # Only while the delay is still climbing: once it is at the ceiling the
+        # message would repeat forever, which is the thing being avoided.
+        if delay and self._attempts < len(RETRY_BACKOFF):
+            self.log("retrying in %.0fs" % delay)
+        self._attempts += 1
+        self._retry_at = time.monotonic() + delay
 
     def _publish_state(self) -> None:
         """A small document describing where the bring-up sequence stands."""

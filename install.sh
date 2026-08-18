@@ -54,3 +54,19 @@ if [ -z "$PREFIX" ]; then
 fi
 
 echo "installed. Start the service with: systemctl enable --now go-multibus"
+
+# Reported, not applied - unlike the package, which switches the port during
+# configure. This script installs a checkout and deliberately changes nothing
+# about how the board boots. Saying it out loud still matters: the symptom of a
+# port in the wrong role is a module that never enumerates, with nothing on the
+# outside to suggest why.
+dr_mode_node=/proc/device-tree/soc@0/bus@32c00000/usb@32e40000/dr_mode
+if [ -z "$PREFIX" ] && [ -r "$dr_mode_node" ]; then
+    dr_mode=$(tr -d '\0' < "$dr_mode_node")
+    if [ "$dr_mode" != host ]; then
+        echo
+        echo "NOTE: the controller's OTG port booted in $dr_mode mode, not host."
+        echo "No module can enumerate over USB until that changes:"
+        echo "    gocontroll-usb-hostmode --apply    # then reboot"
+    fi
+fi

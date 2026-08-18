@@ -165,12 +165,17 @@ machine.
 systemctl start go-multibus
 ```
 
-**A controller whose OTG port is still in device mode needs one reboot.**
-`gocontroll-usb-hostmode.service` runs before `go-multibus`, notices the port is
-not in host mode, and applies the change - but that lands in the u-boot
-environment and the Falcon boot blob, so it only takes effect on the next boot.
-Until then no module enumerates. On a controller that is already in host mode
-the service is a no-op that costs one file read.
+**A controller whose OTG port is still in device mode needs one reboot.** The
+install switches the port itself, but the change lands in the u-boot environment
+and the Falcon boot blob, so it only takes effect on the next boot. Until then
+no module enumerates. On a controller already in host mode the install touches
+nothing.
+
+`gocontroll-usb-hostmode.service` makes the same check before `go-multibus` on
+every boot. That is what covers a package installed into a chroot or an image
+build, where there is no boot environment to write to: the port is switched on
+the first real boot and a module appears on the second. Doing it at install time
+is what keeps an `apt-get install` on a running controller down to one reboot.
 
 From a checkout, `./install.sh` puts the same files in the same places. A
 checkout also runs without installing at all: the entry points in `bin/` add
