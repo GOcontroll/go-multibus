@@ -4,10 +4,16 @@ This is the analysis behind the interface configuration in `MbInterfaces.c` and
 behind the USB layout in `usbd_composite.c`. It answers two questions: what can
 the connector actually carry at the same time, and does that fit through USB.
 
-> The file names in this document - `MbInterfaces.c`, `usbd_composite.c`,
-> `MbProto.c` - are firmware sources and live in the
+> The file names in this document - `MbInterfaces.c`, `MbSupply.c`,
+> `MbProto.c`, `usbd_composite.c` - are firmware sources and live in the
 > [Module-Multibus](https://github.com/GOcontroll/Module-Multibus)
-> repository, not here.
+> repository, not here. That repository is also where these documents are
+> edited; the copies here are installed by the package.
+
+The connector also carries an **external supply** that the module can feed from
+its own regulator, at 5 V to 15 V. That is a separate subsystem with its own
+pins and its own rules, and it has a document of its own:
+[multibus-external-supply.md](multibus-external-supply.md).
 
 ## The connector
 
@@ -60,7 +66,7 @@ to go through the table above. There are four such places:
 - `can_standby()` and `apply_if2/3/4()` in `MbInterfaces.c`
 - `gs_get_fdcan()` and `gs_set_stb()` in `usbd_gs_usb.c`
 - the `rs485_pins` table in `usbd_composite.c`
-- `Config.can_channels` in `gocontroll_multibus_service.py`
+- `Config::can_channels()` in go-multibus' `src/config.rs`
 
 ### CAN channel numbering on the Linux side
 
@@ -189,7 +195,7 @@ out of standby. The same holds the other way around: a serial port whose
 interface is configured as CAN accepts writes and drops them.
 
 Do not rely on the `ttyACM` numbers. Find the port by USB interface number
-instead, which is what `enumerate_ports()` in `gocontroll_multibus.py` does:
+instead, which is what `enumerate_ports()` in go-multibus' `src/discover.rs` does:
 interface 1, 3 and 5 are the serial bridges for connector interfaces 2, 3 and 4,
 and interface 7 is the module protocol.
 

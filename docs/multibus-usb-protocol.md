@@ -1,14 +1,16 @@
 # Multibus module protocol over USB
 
 Reference for the request/response protocol between Linux and the Multibus
-module. The firmware side is `MbProto.c`, the Python side is
-`lib/gocontroll_multibus.py`. Both carry the same command table, so
-extending the protocol means adding an entry in two places and nothing else.
+module. The firmware side is `MbProto.c`; the controller side is `src/proto.rs`
+in the [go-multibus](https://github.com/GOcontroll/go-multibus) repository.
+Both carry the same command table, so extending the protocol means adding an
+entry in two places and nothing else.
 
-> The file names in this document - `MbInterfaces.c`, `usbd_composite.c`,
-> `MbProto.c` - are firmware sources and live in the
+> The file names in this document - `MbInterfaces.c`, `MbSupply.c`,
+> `MbProto.c`, `usbd_composite.c` - are firmware sources and live in the
 > [Module-Multibus](https://github.com/GOcontroll/Module-Multibus)
-> repository, not here.
+> repository, not here. That repository is also where these documents are
+> edited; the copies here are installed by the package.
 
 ## Where it runs
 
@@ -98,7 +100,7 @@ Request: empty. Answer: 14 bytes.
 | 0      | 1    | Protocol version, currently 1                      |
 | 1      | 1    | Role: 0 master, 1 slave/simulator                  |
 | 2-5    | 4    | Hardware id, `20-30-4-<variant>` as go-modules uses it |
-| 6-8    | 3    | Application version, major/minor/patch             |
+| 6-8    | 3    | Application version, major/minor/patch. 0.2.0 is the first with `SUPPLY_*` |
 | 9      | 1    | Number of connector interfaces (5)                 |
 | 10     | 1    | CDC port carrying this protocol (3)                |
 | 11     | 1    | Maximum cell count (24)                            |
@@ -206,6 +208,38 @@ waveform until the module is reset, which is what makes it possible to drive a
 specific cell into an alarm threshold and watch Linux react. Simulator builds
 only.
 
+### 0x50 SUPPLY_GET / 0x51 SUPPLY_SET
+
+The external supply the module can put on the connector.
+
+`SUPPLY_GET` takes no payload. `SUPPLY_SET` takes three bytes: enable, then the
+setpoint in mV as a `uint16`. Both answer with the same ten byte block:
+
+| Offset | Size | Field                                                   |
+|--------|------|---------------------------------------------------------|
+| 0      | 1    | Enabled                                                  |
+| 1-2    | 2    | Setpoint in mV                                           |
+| 3-4    | 2    | Minimum setpoint in mV, currently 5000                   |
+| 5-6    | 2    | Maximum setpoint in mV, currently 15000                  |
+| 7-8    | 2    | Step in mV, currently 1000                               |
+| 9      | 1    | Stored: 1 when flash holds this, 0 when it is live only  |
+
+Like `IF_SET`, a refused value comes back as status `bad parameter` together
+with the state that is actually live, so a caller can always tell what the
+module is doing rather than what it was asked to do.
+
+The limits travel with every answer on purpose: the controller builds its
+picker from what the module reports rather than from a second copy of the
+table, so it can never offer a voltage this module would refuse.
+
+**The module stores this in flash and re-applies it on its next start**, which
+no other setting does. A `stored` of 0 means the flash write failed - the
+setting is live either way, it just will not survive a reset. The whole
+subsystem, including where the record lives and what the controller does with
+it, is in [multibus-external-supply.md](multibus-external-supply.md).
+
+Firmware older than 0.2.0 answers `unknown command` to both.
+
 ## Transport behaviour
 
 **Framing.** The port is a byte stream, so a frame can be split across USB
@@ -220,6 +254,26 @@ and retries twice.
 **No unsolicited traffic.** The module never sends anything on its own. If bytes
 arrive that were not asked for, they are the tail of an earlier answer and are
 discarded by the sequence number check.
+
+## The module bus carries a subset
+
+The controller reaches the same module over SPI before USB exists, using the
+bootloader's 46 byte message format rather than the frames above. Only what the
+controller needs during bring-up is served there:
+
+| Id  | Message      | Answer                                             |
+|-----|--------------|----------------------------------------------------|
+| 9   | `IDENTIFY`   | Hardware and software version, byte 13 set when the application is running |
+| 100 | `IF_GET`     | Five mode bytes at byte 3                          |
+| 101 | `IF_SET`     | Verdict at byte 3, the five active modes at byte 4 |
+| 102 | `STATUS`     | Role, link state, cell count, frame counters       |
+| 103 | `SUPPLY_GET` | The ten byte supply block at byte 3                |
+| 104 | `SUPPLY_SET` | Verdict at byte 3, the supply block at byte 4      |
+
+They start at 100 so they can never collide with a bootloader message. Because
+SPI is full duplex the answer to a request arrives during the *next* transfer,
+so the controller repeats the same message until the matching reply comes back;
+that is safe because every one of them is idempotent.
 
 ## The isoSPI side
 

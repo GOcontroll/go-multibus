@@ -5,9 +5,20 @@ its interfaces, and keeps the battery cell data flowing to the rest of the
 system. It is the piece that makes the module work without anyone typing
 anything.
 
+> The file names in this document - `MbInterfaces.c`, `MbSupply.c`,
+> `MbProto.c`, `usbd_composite.c` - are firmware sources and live in the
+> [Module-Multibus](https://github.com/GOcontroll/Module-Multibus)
+> repository, not here. That repository is also where these documents are
+> edited; the copies here are installed by the package.
+
 It has two faces over one state machine: a background service that runs at boot,
 and a terminal UI for commissioning a machine. What the UI shows is exactly what
 the service does, because both drive the same code.
+
+It lives in its own repository,
+[GOcontroll/go-multibus](https://github.com/GOcontroll/go-multibus), and is a
+Rust binary built on `crossterm` - the same as `go-can` and `go-modules`, which
+is what makes the three tools look and behave alike rather than merely similar.
 
 ## The problem it solves
 
@@ -23,6 +34,9 @@ A freshly powered module does not do anything useful on its own:
 - The controller has to know which of the three CAN channels and which of the
   three serial ports actually have a transceiver behind them, so it can bring up
   the right network interfaces and leave the others alone.
+- The external supply on the connector has to be what the machine expects. The
+  module remembers that one by itself, but the controller still owns the value -
+  see [multibus-external-supply.md](multibus-external-supply.md).
 
 The order matters, and it is the reason the configuration goes over SPI:
 
@@ -41,7 +55,7 @@ The order matters, and it is the reason the configuration goes over SPI:
 |-------------|---------------------------------------------------------------------|
 | `reset`     | Pulse the slot reset line. The STM32 restarts into the bootloader.   |
 | `start`     | Identify the module, then send the bootloader `UP_TO_DATE` so it jumps to the application. |
-| `configure` | Send `IF_SET` over the module bus with the five interface modes.     |
+| `configure` | Send `IF_SET` over the module bus with the five interface modes, then `SUPPLY_SET` with the external supply. |
 | `enumerate` | Wait for the USB device and its four CDC ports, then open the protocol port and apply the cell configuration. |
 | `running`   | Poll the cell snapshot and publish it.                               |
 
@@ -59,14 +73,14 @@ module. A failure during bring-up restarts the sequence immediately.
 Two links to the same module, each doing what it is good at:
 
 **The module bus (SPI)** exists before USB and stays available regardless of
-whether USB enumerated. It carries the interface configuration and a compact
-status message. `ModuleBus.c` serves it in the application, using the same 46
-byte message format as the bootloader so `gocontroll-modulebus` needs no
-second code path.
+whether USB enumerated. It carries the interface configuration, the external
+supply and a compact status message. `ModuleBus.c` serves it in the
+application, using the same 46 byte message format as the bootloader so
+`gocontroll-modulebus` needs no second code path.
 
 Because SPI is full duplex, the module cannot answer in the transfer that
 carries the request - it only learns what was asked once the last byte is
-clocked in. The reply goes out with the *next* transfer, so the Python side
+clocked in. The reply goes out with the *next* transfer, so the controller
 sends the same message repeatedly until the matching answer comes back. That is
 safe because every application message is idempotent.
 
@@ -77,21 +91,30 @@ byte message. See [multibus-usb-protocol.md](multibus-usb-protocol.md).
 
 ### As a service
 
+The controller tooling is packaged, so on a board on the GOcontroll apt
+repository this is the whole story:
+
 ```bash
-install -m 755 bin/go-multibus        /usr/bin/go-multibus
-install -m 755 bin/gocontroll-cellmon  /usr/bin/gocontroll-cellmon
-install -m 755 bin/gocontroll-modulebus /usr/bin/gocontroll-modulebus
-install -d /usr/lib/gocontroll-multibus
-install -m 644 lib/gocontroll_multibus.py /usr/lib/gocontroll-multibus/
-install -m 644 lib/gocontroll_multibus_service.py /usr/lib/gocontroll-multibus/
-install -m 644 debian/systemd/go-multibus.service /etc/systemd/system/
+apt-get install go-multibus
 systemctl enable --now go-multibus
 ```
 
-The entry points drop their `.py` so they read like `go-can` and `go-modules`.
-The shared modules go to `/usr/lib/gocontroll-multibus`, which every script adds
-to its import path - along with its own directory, so a checkout still runs
-without installing anything.
+From a checkout of the go-multibus repository, build and install by hand:
+
+```bash
+cargo build --release       # on the controller itself
+sudo ./install.sh           # same paths the package uses
+```
+
+or cross-build and point `BINDIR` at the result:
+
+```bash
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+BINDIR=target/aarch64-unknown-linux-musl/release ./install.sh
+```
+
+`install.sh` also stages into a `PREFIX` for the package build, so the package
+and a manual install cannot drift apart.
 
 Only run one of `go-multibus daemon` and `gocontroll-cellmon serve` at a time.
 Both open the protocol port, and two processes writing to one CDC port interleave
@@ -109,17 +132,18 @@ bottom. Navigation is the same too - move with the arrows, Enter to descend into
 a picker, Left or Esc to come back, q or Esc to leave.
 
 ```
-  GOcontroll Moduline Multibus tool  v0.1.0
+  GOcontroll Moduline Multibus tool  v0.2.0
   ------------------------------------
   Module: slot 8   running
   ------------------------------------
-    Interface 1  6/5      CAN       fixed
-    Interface 2  12/13    RS485
-  > Interface 3  18/19    CAN
-    Interface 4  24/25    RS485
-    Interface 5  isoSPI   isoSPI
+    Interface 1   6/5      CAN FD      fixed
+    Interface 2   12/13    RS485
+  > Interface 3   18/19    CAN FD
+    Interface 4   24/25    RS485
+    Interface 5   isoSPI   isoSPI
+    Supply        5-15 V   9 V         kept over a reset
   ------------------------------------
-  up/down navigate   Enter select mode   c cells   r reset   q quit
+  up/down navigate   Enter select   c cells   r restart   q quit
 ```
 
 Enter on an interface opens its mode picker, listing only what that interface
@@ -140,8 +164,29 @@ effect, the way go-can's bitrate picker saves and configures in one keypress.
 Applying implies a module reset, because the configuration travels over the
 module bus, which is only read before USB comes up. The hint line says so.
 
-Interface 1 and 5 are fixed, so their picker has a single entry and a note
-saying it is not configurable.
+Interface 1 is fixed, so its picker has a single entry and a note saying it is
+not configurable.
+
+The last row is the **external supply**, and it is the one thing in the list
+that applies without a reset - the module takes the setpoint immediately and
+writes it to its own flash:
+
+```
+  External supply  -  Select Voltage
+
+    off
+    5 V
+    6 V
+  > 7 V
+    ...
+    15 V
+  ------------------------------------
+  up/down navigate   Enter apply   left/Esc back
+```
+
+One picker covers both the on/off state and the voltage: `off` disables the
+regulator, any voltage enables it at that setpoint. The steps come from what
+the module reports, not from a table in the tool.
 
 `c` opens the cell voltages, `Esc` or Left comes back:
 
@@ -171,15 +216,63 @@ $ go-multibus status
 state      : running
 slot       : 8
 interfaces : can, rs485, can, rs485, isospi
+supply     : 9 V
 cells      : 12, pack 43.464 V, spread 0.0440 V (simulated)
 
 $ go-multibus config
 $ go-multibus set 3 can
+$ go-multibus supply 9V
+$ go-multibus ports
 ```
 
 `set` writes the configuration file and tells you to restart the service; it
 does not touch a running module, so a scripted change and a running machine
 never disagree about what is happening.
+
+`supply` is the exception, and for the same reason the UI's supply picker is:
+changing the voltage needs no reset, so it is stored *and* applied straight
+away when the module is reachable. When it is not, the value is still stored
+and the next bring-up pushes it.
+
+`status --json` prints the two published documents instead of the summary.
+
+## Before any of this works: the OTG port
+
+A Multibus module hangs off the controller's OTG USB port, and on an i.MX8MM
+Moduline that port comes up as a USB *device* (the serial console gadget) unless
+it has been told otherwise. A port in that role can never enumerate a module,
+however often the module is reset - and the symptom gives nothing away: the
+module simply never appears.
+
+This is a once-per-controller change, and it survives reboots:
+
+```console
+# gocontroll-usb-hostmode            # report what the port booted as
+# gocontroll-usb-hostmode --apply    # switch it to host
+# reboot
+```
+
+Check afterwards:
+
+```bash
+tr -d '\0' < /proc/device-tree/soc@0/bus@32c00000/usb@32e40000/dr_mode   # -> host
+dmesg | grep 'new .*-speed USB device'
+```
+
+The setting lives in the u-boot environment (`otg_mode`), not in the device
+tree, so it only takes effect on the boot *after* the one that writes it. The
+`go-multibus` package applies it during `configure` for exactly that reason:
+left to the service, the first reboot after installing would still come up in
+peripheral mode and a second would be needed before anything enumerated.
+
+**`dr_mode=otg` with a runtime role switch is not good enough.** That leaves the
+i.MX8 PHY half initialised: the host sees a device but the module never sees a
+bus reset, so enumeration fails with `device descriptor read/64, error -71` and
+no amount of firmware work will fix it. `host` is the value that works.
+
+`go-multibus` names this outright when a bring-up times out, rather than saying
+"check the cable": it reads the device tree node and, if the port is in the
+wrong role, says so and what to run.
 
 ## Configuration file
 
@@ -195,7 +288,9 @@ missing file is itself a working configuration.
   "publish_interval_s": 0.5,
   "bring_up_can": true,
   "can_bitrate": 500000,
-  "output": "/dev/shm/gocontroll/multibus-cells.json"
+  "output": "/dev/shm/gocontroll/multibus-cells.json",
+  "supply_enabled": false,
+  "supply_mv": 5000
 }
 ```
 
@@ -206,9 +301,11 @@ missing file is itself a working configuration.
 | `cell_count` | How many cells the battery side reports, 1..24. |
 | `module_poll_ms` | How often the module polls the battery over isoSPI. |
 | `publish_interval_s` | How often the service reads the module and rewrites the file. |
-| `bring_up_can` | Whether the service raises the module's CAN interfaces. |
-| `can_bitrate` | Fallback bit rate, used only when go-can cannot configure them. |
+| `bring_up_can` | Whether the service runs `ip link set canX up`. |
+| `can_bitrate` | Bit rate for those interfaces. |
 | `output` | Where the cell data is published. |
+| `supply_enabled` | Whether the module's regulator is on. |
+| `supply_mv` | Its setpoint in mV, a whole number of volts from 5000 to 15000. |
 
 `module_poll_ms` and `publish_interval_s` are independent. The module keeps its
 own most recent snapshot, so a publish never waits for a battery round trip - it
@@ -222,7 +319,8 @@ controller. A Moduline IV has four onboard mcp251x CAN controllers, so the
 module's channels land on `can4`..`can6`; an M1 has two, so the same module
 lands on `can2`..`can4`. The `ttyACM` numbers move for the same reason.
 
-`debian/udev/81-gocontroll-multibus.rules` pins them down:
+`debian/udev/81-gocontroll-multibus.rules`, installed by the package, pins them
+down:
 
 | Name               | Knowledge base    | Connector interface | Pins  |
 |--------------------|-------------------|---------------------|-------|
@@ -270,13 +368,6 @@ because the USB descriptor is fixed. The service only brings up the ones with a
 live transceiver: `mb_can1` is always CAN, `mb_can2` and `mb_can3` follow
 connector interfaces 3 and 4. A channel whose interface is RS485 is left down,
 since a netdev that can never carry a frame is worse than no netdev at all.
-
-**The bitrate is go-can's, not ours.** Each interface is raised with
-`go-can apply <iface>`, which reads `/etc/gocontroll/can.d/<iface>.conf`. Setting
-a bitrate here as well would make the two tools disagree - go-can would keep
-reporting its stored value while the interface actually ran at the service's.
-`can_bitrate` in the service config is only a fallback for a controller where
-go-can is not installed, or has no config for the interface yet.
 
 ## Bitrates: go-can, not go-multibus
 
@@ -341,12 +432,18 @@ stands:
   "slot": 8,
   "module_running": true,
   "interfaces": ["can", "rs485", "can", "rs485", "isospi"],
+  "supply": {
+    "enabled": true, "volts": 9.0, "millivolts": 9000,
+    "min_mv": 5000, "max_mv": 15000, "step_mv": 1000, "stored": true
+  },
   "failures": 0,
   "last_error": ""
 }
 ```
 
-Both are written to a temporary file and moved into place with `os.replace`,
+`supply` is `null` on a module whose firmware predates 0.2.0.
+
+Both are written to a temporary file and moved into place with `rename(2)`,
 which is atomic on Linux. A reader either sees the previous document or the new
 one in full, never half of either, so it needs no locking and no cooperation
 with the writer.
@@ -361,9 +458,10 @@ a dead battery link; this way it can.
 |---------|---------------|
 | stuck in `start` | The module does not answer on the module bus. Either the slot is empty or the reset line does not reach the STM32. |
 | stuck in `configure` | The bootloader handed over but the application does not answer. Most likely an older build without `ModuleBus.c`; apply the configuration over USB instead. |
-| stuck in `enumerate` | The application runs but USB does not come up. The log says whether the controller's OTG port booted in the wrong role; if it did, `gocontroll-usb-hostmode --apply` and a reboot fix it. Otherwise look at the cable and the module. |
+| stuck in `enumerate` | The application runs but USB does not come up. Check that the controller port is in host mode. |
 | `running`, `failures` climbing | USB works but polls fail. `journalctl -u go-multibus` has the error text. |
 | `running` but `valid` false | USB is fine and the isoSPI link is not. Use `gocontroll-cellmon status` on the counters. |
+| supply row says `not supported by this firmware` | The module runs a build older than 0.2.0. Everything else works; flash a current image to get the supply. |
 
 ## Related documents
 
@@ -371,5 +469,7 @@ a dead battery link; this way it can.
   combinations exist, and why the RS485 labels do not match the interface numbers.
 - [multibus-usb-protocol.md](multibus-usb-protocol.md) - frame format and command
   reference for the USB side.
+- [multibus-external-supply.md](multibus-external-supply.md) - the regulator on
+  the connector, its range, and why it is the one setting the module remembers.
 - [gocontroll-cellmon.md](gocontroll-cellmon.md) - the cell data itself and the
   standalone tooling for reading it.

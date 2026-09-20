@@ -4,15 +4,17 @@ GOcontroll Multibus module service and utilities for Moduline controllers
 (L4, M1, HMI1) running on i.MX8MM hardware.
 
 Brings a Multibus module up after a controller boot, configures which physical
-interface each connector pin pair carries, and publishes the battery cell
-voltages it reads over isoSPI to `/dev/shm` for the rest of the system.
+interface each connector pin pair carries, sets the external supply on the
+connector, and publishes the battery cell voltages it reads over isoSPI to
+`/dev/shm` for the rest of the system.
 
 Two faces over one state machine: a background service that runs at boot, and a
-terminal UI in the style of `go-can` for commissioning a machine. What the UI
-shows is what the service does, because both drive the same code.
+terminal UI for commissioning a machine. What the UI shows is what the service
+does, because both drive the same code.
 
-Pure standard-library Python 3 - no pyserial, no pyusb, nothing to install on
-the controller beyond the interpreter it already has.
+Rust and `crossterm`, the same as `go-can` and `go-modules` - which is what
+makes the three tools look and behave alike rather than merely similar. The
+result is three static binaries and no runtime dependencies on the controller.
 
 ## CLI
 
@@ -25,6 +27,9 @@ go-multibus daemon                       # background service, systemd entry
 go-multibus status                       # one-shot summary, scriptable
 go-multibus config                       # show the stored configuration
 go-multibus set 3 can                    # change one interface, store it
+go-multibus supply 9V                    # external supply: store and apply
+go-multibus supply off
+go-multibus ports                        # which ports and CAN interfaces exist
 
 gocontroll-cellmon list                  # which Multibus devices are present
 gocontroll-cellmon info                  # identity, role, capabilities
@@ -32,12 +37,14 @@ gocontroll-cellmon status                # isoSPI link counters
 gocontroll-cellmon cells                 # one cell snapshot
 gocontroll-cellmon watch                 # keep printing snapshots
 gocontroll-cellmon interfaces --set can,rs485,can,rs485,isospi
+gocontroll-cellmon supply 9V             # external supply, over USB
 gocontroll-cellmon raw 03 60 f4 6c       # raw isoSPI transfer
 gocontroll-cellmon serve                 # publish to /dev/shm
 
-gocontroll-modulebus probe 8             # module bus handshake, over SPI
-gocontroll-modulebus start 8             # bootloader -> application
-gocontroll-modulebus interfaces 8        # read/write config over SPI
+gocontroll-modulebus 8 probe             # module bus handshake, over SPI
+gocontroll-modulebus 8 start             # bootloader -> application
+gocontroll-modulebus 8 interfaces        # read/write config over SPI
+gocontroll-modulebus 8 supply 9V         # external supply, before USB exists
 ```
 
 Only one of `go-multibus daemon` and the UI can run at a time: both open the
@@ -59,7 +66,7 @@ answers. The UI refuses to start while the service is active and says so.
 |-------------|-----------------------------------------------------------------|
 | `reset`     | Pulse the slot reset line; the STM32 restarts into the bootloader |
 | `start`     | Tell the bootloader its firmware is current so it starts the application |
-| `configure` | Push the five interface modes over the module bus                |
+| `configure` | Push the five interface modes and the external supply over the module bus |
 | `enumerate` | Wait for USB, open the protocol port, apply the cell configuration |
 | `running`   | Poll the cell snapshot and publish it                            |
 
@@ -93,6 +100,28 @@ the baseboard buses. **go-multibus owns the mode, go-can owns the parameters.**
 The service raises each interface with `go-can apply`, so the two never disagree
 about what a bus is running at.
 
+## The external supply
+
+The module can feed whatever is plugged into the connector from its own
+regulator, at 5 V to 15 V in whole volts. `go-multibus` shows it as the last row
+of its list, and Enter opens a picker with `off` and every volt the module
+accepts - the steps come from what the module reports, not from a table here.
+
+**It is the one setting the module remembers by itself.** The firmware keeps it
+in flash and restores it before anything else starts, so a sensor powered by the
+module gets its voltage back after a reset without waiting for Linux. The
+controller's copy still wins: `supply_enabled` and `supply_mv` are pushed on
+every bring-up, so an edit made while the module was out of its slot takes
+effect when it comes back.
+
+Changing it needs no reset, unlike an interface change. The module takes the
+setpoint immediately, which is why `go-multibus supply` and the UI's picker both
+store *and* apply in one step.
+
+There is no feedback path from the regulator back into the MCU, so everything
+reported is the setpoint, never a measurement. Details in
+[docs/multibus-external-supply.md](docs/multibus-external-supply.md).
+
 ## Device names
 
 Names are pinned by `debian/udev/81-gocontroll-multibus.rules`, because kernel
@@ -117,7 +146,9 @@ anything else on the controller that refers to a name needs it.
   "publish_interval_s": 0.5,
   "bring_up_can": true,
   "can_bitrate": 500000,
-  "output": "/dev/shm/gocontroll/multibus-cells.json"
+  "output": "/dev/shm/gocontroll/multibus-cells.json",
+  "supply_enabled": false,
+  "supply_mv": 5000
 }
 ```
 
@@ -128,7 +159,7 @@ interface 3 and drives `mb_can2`.
 
 `/dev/shm/gocontroll/multibus-cells.json` holds the measurements and
 `multibus-state.json` where the bring-up sequence stands. Both are written to a
-temporary file and moved into place with `os.replace`, which is atomic on Linux:
+temporary file and moved into place with `rename(2)`, which is atomic on Linux:
 a reader sees either the previous document or the new one, never half of either,
 and needs no locking.
 
@@ -177,19 +208,42 @@ build, where there is no boot environment to write to: the port is switched on
 the first real boot and a module appears on the second. Doing it at install time
 is what keeps an `apt-get install` on a running controller down to one reboot.
 
-From a checkout, `./install.sh` puts the same files in the same places. A
-checkout also runs without installing at all: the entry points in `bin/` add
-`../lib` to their import path.
+### From a checkout
+
+```sh
+cargo build --release && sudo ./install.sh          # on the controller
+```
+
+or cross-build and say where the binaries are:
+
+```sh
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+BINDIR=target/aarch64-unknown-linux-musl/release ./install.sh
+```
+
+`install.sh` puts the same files in the same places as the package, because the
+package is built by running it into a staging prefix.
 
 ### Building the package
 
 ```sh
-debian/build-deb.sh 0.1.0 dist
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+BINDIR=target/aarch64-unknown-linux-musl/release debian/build-deb.sh 0.2.0 dist
 ```
 
 The same script the release workflow runs, so what CI publishes is what you can
 build and inspect locally. Tagging `v*` builds it, attaches it to a GitHub
 release, and tells the GOcontroll apt index to pick it up.
+
+### Tests
+
+```sh
+cargo test
+```
+
+Everything covered is pure logic - the frame codec, the module bus message
+format, the configuration file, the supply picker - so the suite runs on any
+machine and needs neither a controller nor a module.
 
 ## USB host mode
 
@@ -209,8 +263,15 @@ see the current state; `--apply` changes it, `--revert` puts the backups back.
 
 The module needs firmware with `MbProto` and `ModuleBus` - version 0.1.0 or
 later. Older images serve the protocol port as a plain RS485 bridge, and the
-tooling says so rather than reporting a vague timeout. Firmware lives in the
-[Module-Multibus](https://github.com/GOcontroll/Module-Multibus) repository.
+tooling says so rather than reporting a vague timeout.
+
+The external supply needs **0.2.0 or later**. On an older image everything else
+works and the supply row reads `not supported by this firmware`, which is
+reported once rather than on every bring-up.
+
+Firmware lives in the
+[Module-Multibus](https://github.com/GOcontroll/Module-Multibus) repository,
+which is also where the documents under `docs/` are edited.
 
 ## Examples
 
@@ -229,6 +290,9 @@ signal parsed out as an example. See [examples/README.md](examples/README.md).
   and command reference.
 - [docs/multibus-interfaces.md](docs/multibus-interfaces.md) - which interface
   combinations exist and why.
+- [docs/multibus-external-supply.md](docs/multibus-external-supply.md) - the
+  regulator on the connector, its range, and why it is the one setting the
+  module remembers.
 
 ## Exit codes
 

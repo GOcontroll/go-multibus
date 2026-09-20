@@ -1,7 +1,13 @@
 # gocontroll-cellmon: reading battery cell voltages from Linux
 
 How the Multibus module makes battery cell voltages available on a GOcontroll
-controller, and how to use the Python tooling that reads them.
+controller, and how to use the tooling that reads them.
+
+> The file names in this document - `MbInterfaces.c`, `MbSupply.c`,
+> `MbProto.c`, `usbd_composite.c` - are firmware sources and live in the
+> [Module-Multibus](https://github.com/GOcontroll/Module-Multibus)
+> repository, not here. That repository is also where these documents are
+> edited; the copies here are installed by the package.
 
 This document is written to be the source for a knowledge base article. It
 describes what the software does and why, not only which commands to type.
@@ -31,30 +37,30 @@ Three separate rhythms are involved, and it helps to keep them apart:
 | Loop                    | Interval        | Set by                          |
 |-------------------------|-----------------|---------------------------------|
 | Module polls the battery over isoSPI | 100 ms, configurable | `CELLS_CONFIG` |
-| Python polls the module over USB     | 500 ms, configurable | `--interval`   |
+| The controller polls the module over USB | 500 ms, configurable | `--interval` |
 | Application reads the JSON file      | whenever it likes    | the reader     |
 
 They are deliberately decoupled. The module keeps its own most recent snapshot,
-so a Python poll never has to wait for a battery round trip - it always gets an
+so a poll never has to wait for a battery round trip - it always gets an
 answer immediately, together with an `age_ms` field saying how old that answer
 is. A reader that cares about freshness checks `age_ms`; a reader that does not
 just reads the numbers.
 
-## The two files
+## Where the code lives
 
-`lib/gocontroll_multibus.py` is the library. It knows the frame format,
-the command table and the structure layouts, and it exposes them as ordinary
-Python objects. Import this when writing your own software against the module.
+All of it is in the [go-multibus](https://github.com/GOcontroll/go-multibus)
+repository, as one Rust crate:
 
-`bin/gocontroll-cellmon` is the command line tool and the service.
-Use this to bring the chain up, to look at what is going on, and to publish the
-measurements for other software.
+| Module | What it is |
+|---|---|
+| `src/proto.rs` | the frame codec, the command table and the structure layouts |
+| `src/link.rs` | one open connection to the protocol port |
+| `src/bin/cellmon.rs` | the `gocontroll-cellmon` command line tool and service |
 
-Neither needs anything outside the Python standard library. The CDC-ACM port is
-opened with `os.open` and put into raw mode with `termios` directly rather than
-through pyserial, for the same reason `gocontroll-modulebus` talks to spidev
-through raw ioctls: a controller image should not need extra packages installed
-before its own hardware works.
+The CDC-ACM port is opened directly and put into raw mode with termios rather
+than through a serial crate, for the same reason `src/modulebus.rs` talks to
+spidev through raw ioctls: the tool ships as one static binary, and every
+dependency it does not have is one that cannot go missing on a controller.
 
 ## Command line use
 
@@ -182,8 +188,15 @@ is written in firmware.
 ```
 
 `serve` polls the module and publishes one JSON document to
-`/dev/shm/gocontroll/multibus-cells.json`. Install the unit from
-`debian/systemd/gocontroll-cellmon.service` to have it start at boot.
+`/dev/shm/gocontroll/multibus-cells.json`. The package installs the unit, so
+`systemctl enable --now gocontroll-cellmon` is all it takes to have it start at
+boot.
+
+Run either `gocontroll-cellmon serve` or `go-multibus daemon`, never both: they
+both open the protocol port, and two processes writing to one CDC port
+interleave their requests so each sees the other's answers. On a controller with
+a module in it, `go-multibus daemon` is the one you want - it also brings the
+module up.
 
 ### The published document
 
@@ -249,7 +262,8 @@ reset without anyone having to restart the service.
 
 ## Reading the data from your own software
 
-From Python, the file is the simplest route:
+The published file is the simplest route, and the one to prefer: it costs no USB
+traffic and cannot collide with the service.
 
 ```python
 import json
@@ -261,27 +275,29 @@ if data["valid"]:
     print("lowest cell: %.4f V" % data["min_v"])
 ```
 
-To talk to the module directly instead, use the library:
+To talk to the module directly from Rust instead, the crate is a library as well
+as a set of binaries:
 
-```python
-from gocontroll_multibus import MultibusLink
+```rust
+use go_multibus::link::MultibusLink;
 
-with MultibusLink.open() as link:
-    snapshot = link.read_cells()
-    if snapshot.link_ok and not snapshot.stale:
-        print(snapshot.cells_v)
+let mut link = MultibusLink::open(None)?;
+let snapshot = link.read_cells()?;
+if snapshot.link_ok() && !snapshot.stale() {
+    println!("{:?}", snapshot.cells_v());
+}
 ```
 
-Do not run `serve` and your own reader against the same module at the same time.
-Two processes writing to one CDC port interleave their requests and each will
-see the other's answers.
+Do not run a reader of your own against the same module while the service has
+the port open. Two processes writing to one CDC port interleave their requests
+and each will see the other's answers.
 
 ## Testing without a battery
 
 The second Multibus module runs a simulator build. It answers the master's
 requests with generated cell voltages, so the whole chain - isoSPI, USB, the
-Python service and whatever reads the JSON - can be tested end to end before a
-real pack exists.
+service and whatever reads the JSON - can be tested end to end before a real
+pack exists.
 
 Each simulated cell follows a triangle wave of 150 mV around a resting voltage,
 with a phase offset per cell so the values never move in lockstep. That makes it
@@ -305,17 +321,12 @@ module is the simulator. On a master build it comes back as `not supported`.
 ## Installing
 
 ```bash
-./install.sh
+apt-get install go-multibus
 systemctl enable --now gocontroll-cellmon
 ```
 
-`gocontroll-cellmon` is a standalone alternative to the `go-multibus` service:
-it reads the cell data but does not bring the module up or configure it. Run one
-or the other, never both - they would each open the protocol port and read the
-other's answers.
-
-A checkout runs without installing, because the entry points in `bin/` add
-`../lib` to their import path.
+`gocontroll-cellmon` ships in the same package as `go-multibus`; see
+[go-multibus.md](go-multibus.md#running-it) for installing from a checkout.
 
 ## Troubleshooting
 
@@ -335,3 +346,6 @@ A checkout runs without installing, because the entry points in `bin/` add
   combinations are possible and why the protocol shares a CDC port.
 - [multibus-usb-protocol.md](multibus-usb-protocol.md) - the frame format and the
   complete command reference.
+- [go-multibus.md](go-multibus.md) - the service that brings the module up and
+  keeps it publishing, which is what a controller normally runs instead of
+  `gocontroll-cellmon serve`.
