@@ -1,0 +1,48 @@
+[package]
+name = "go-multibus"
+version = "0.2.0"
+edition = "2021"
+authors = ["GOcontroll B.V. <info@gocontroll.com>"]
+description = "GOcontroll Multibus module service, configuration UI and utilities"
+license = "MIT"
+repository = "https://github.com/GOcontroll/go-multibus"
+readme = "README.md"
+homepage = "https://gocontroll.com"
+publish = false
+
+[lints.rust]
+# Everything that has to reach a kernel interface goes through one of the two
+# modules that own an unsafe block (link.rs for termios, modulebus.rs for the
+# spidev ioctls). Forbidding it crate-wide would just move those blocks around,
+# so the rule is narrower: nothing else may introduce one.
+unsafe_code = "allow"
+
+[lib]
+name = "go_multibus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "go-multibus"
+path = "src/main.rs"
+
+[[bin]]
+name = "gocontroll-cellmon"
+path = "src/bin/cellmon.rs"
+
+[[bin]]
+name = "gocontroll-modulebus"
+path = "src/bin/modulebus.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[profile.release]
+opt-level = "z"        # the daemon starts during boot; smaller is a faster start
+lto = true
+codegen-units = 1
+strip = true

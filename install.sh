@@ -8,6 +8,16 @@
 # This script is for developing against a checkout, and for a board that is not
 # on the GOcontroll apt repository.
 #
+# The three tools are Rust binaries, so something has to have built them first.
+# Run it on the controller itself:
+#
+#     cargo build --release && sudo ./install.sh
+#
+# or cross-build and point BINDIR at the result:
+#
+#     cargo zigbuild --release --target aarch64-unknown-linux-musl
+#     BINDIR=target/aarch64-unknown-linux-musl/release ./install.sh
+#
 # Services are installed but not started: the service resets the module and
 # raises CAN interfaces, which is not something an install should do underneath
 # a running machine. Run `systemctl enable --now go-multibus` when you want it.
@@ -15,7 +25,6 @@ set -e
 
 PREFIX="${PREFIX:-}"
 BIN="$PREFIX/usr/bin"
-LIB="$PREFIX/usr/lib/gocontroll-multibus"
 UNITS="$PREFIX/usr/lib/systemd/system"
 RULES="$PREFIX/usr/lib/udev/rules.d"
 UDEVLIB="$PREFIX/usr/lib/udev"
@@ -23,18 +32,42 @@ DOC="$PREFIX/usr/share/doc/go-multibus"
 
 here=$(cd "$(dirname "$0")" && pwd)
 
-install -d "$BIN" "$LIB" "$UNITS" "$RULES" "$UDEVLIB" "$DOC"
+# Where the built binaries are. Checked in the order they are most likely to be
+# the ones meant: an explicit BINDIR, then a cross build for the controller,
+# then a native one.
+if [ -z "${BINDIR:-}" ]; then
+    for candidate in \
+        "$here/target/aarch64-unknown-linux-musl/release" \
+        "$here/target/aarch64-unknown-linux-gnu/release" \
+        "$here/target/release"
+    do
+        if [ -x "$candidate/go-multibus" ]; then
+            BINDIR="$candidate"
+            break
+        fi
+    done
+fi
 
-install -m 755 "$here/bin/go-multibus"             "$BIN/go-multibus"
-install -m 755 "$here/bin/gocontroll-cellmon"      "$BIN/gocontroll-cellmon"
-install -m 755 "$here/bin/gocontroll-modulebus"    "$BIN/gocontroll-modulebus"
+if [ -z "${BINDIR:-}" ] || [ ! -x "$BINDIR/go-multibus" ]; then
+    echo "no built binaries found. Build them first:" >&2
+    echo "    cargo build --release" >&2
+    echo "or point BINDIR at an existing build." >&2
+    exit 1
+fi
+
+install -d "$BIN" "$UNITS" "$RULES" "$UDEVLIB" "$DOC"
+
+install -m 755 "$BINDIR/go-multibus"           "$BIN/go-multibus"
+install -m 755 "$BINDIR/gocontroll-cellmon"    "$BIN/gocontroll-cellmon"
+install -m 755 "$BINDIR/gocontroll-modulebus"  "$BIN/gocontroll-modulebus"
+
+# The one tool that is still a script. It rewrites the u-boot environment and
+# the Falcon boot blob, runs once at install time, and never at runtime - so it
+# has nothing to gain from being a binary.
 install -m 755 "$here/bin/gocontroll-usb-hostmode" "$BIN/gocontroll-usb-hostmode"
 
-install -m 644 "$here/lib/gocontroll_multibus.py"         "$LIB/"
-install -m 644 "$here/lib/gocontroll_multibus_service.py" "$LIB/"
-
-install -m 644 "$here/debian/systemd/go-multibus.service"            "$UNITS/"
-install -m 644 "$here/debian/systemd/gocontroll-cellmon.service"     "$UNITS/"
+install -m 644 "$here/debian/systemd/go-multibus.service"             "$UNITS/"
+install -m 644 "$here/debian/systemd/gocontroll-cellmon.service"      "$UNITS/"
 install -m 644 "$here/debian/systemd/gocontroll-usb-hostmode.service" "$UNITS/"
 
 install -m 644 "$here/debian/udev/81-gocontroll-multibus.rules" "$RULES/"
@@ -53,7 +86,8 @@ if [ -z "$PREFIX" ]; then
     systemctl daemon-reload
 fi
 
-echo "installed. Start the service with: systemctl enable --now go-multibus"
+echo "installed from $BINDIR"
+echo "start the service with: systemctl enable --now go-multibus"
 
 # Reported, not applied - unlike the package, which switches the port during
 # configure. This script installs a checkout and deliberately changes nothing

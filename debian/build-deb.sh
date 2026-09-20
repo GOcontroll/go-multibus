@@ -4,17 +4,19 @@
 # Used by .github/workflows/build-package.yml and runnable by hand, so what CI
 # publishes is what you can build and inspect locally:
 #
-#     debian/build-deb.sh 0.1.0 /tmp/dist
+#     cargo zigbuild --release --target aarch64-unknown-linux-musl
+#     debian/build-deb.sh 0.2.0 /tmp/dist
 #
-# Pure Python, so the package is Architecture: all. dpkg-scanpackages --arch
-# arm64 picks up _all.deb as well, so the GOcontroll index carries it unchanged.
+# The tools are Rust binaries for the controller, so the package is
+# Architecture: arm64 and something must have built them before this runs.
+# BINDIR says where they are; install.sh finds them the same way.
 set -euo pipefail
 
 VERSION="${1:?usage: build-deb.sh <version> [outdir]}"
 DIST="${2:-dist}"
 
 PACKAGE=go-multibus
-ARCH=all
+ARCH=arm64
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 BUILD=$(mktemp -d)/"${PACKAGE}_${VERSION}_${ARCH}"
@@ -22,8 +24,10 @@ BUILD=$(mktemp -d)/"${PACKAGE}_${VERSION}_${ARCH}"
 mkdir -p "${BUILD}/DEBIAN" "${DIST}"
 
 # Everything below /usr comes from install.sh, so the package and a manual
-# install cannot drift apart.
-PREFIX="${BUILD}" sh "${here}/install.sh" > /dev/null
+# install cannot drift apart. BINDIR is passed through: without it install.sh
+# would go looking for a build of its own, and pick whichever one happened to be
+# lying around in target/.
+PREFIX="${BUILD}" BINDIR="${BINDIR:-}" sh "${here}/install.sh" > /dev/null
 
 cat > "${BUILD}/DEBIAN/control" << CONTROL
 Package: ${PACKAGE}
@@ -45,6 +49,9 @@ Description: GOcontroll Multibus module service and utilities
  reading cell data, gocontroll-modulebus for the SPI module bus, and
  gocontroll-usb-hostmode to put the controller's OTG port in host mode -
  without which a module never enumerates.
+ .
+ The interactive UI is built on crossterm and matches go-can and go-modules,
+ so the three tools look and behave the same way.
  .
  Deterministic device names (mb_can1..3, /dev/mb_serial1..3, /dev/mb_protocol)
  are installed as udev rules.
