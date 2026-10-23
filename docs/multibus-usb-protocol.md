@@ -186,6 +186,32 @@ rising while `rx_frames` stays put means the master is clocking and nothing is
 answering - a wiring or a slave problem. Both rising while `crc_errors` also
 rises points at signal integrity.
 
+### 0x11 LINK_DIAG
+
+Request: empty. Answer: 32 bytes about the master watchdog.
+
+| Offset | Size | Field                                                   |
+|--------|------|---------------------------------------------------------|
+| 0      | 4    | Times the watchdog had to reset a stuck transaction      |
+| 4      | 4    | SPI2 SR at the last stall                                |
+| 8      | 4    | SPI2 CR1                                                 |
+| 12     | 4    | SPI2 CR2                                                 |
+| 16     | 4    | HAL error code                                           |
+| 20     | 2    | Bytes HAL still had to send                              |
+| 22     | 2    | Bytes HAL still had to receive                           |
+| 24     | 1    | HAL state                                                |
+| 25     | 3    | Reserved                                                 |
+| 28     | 4    | Module tick of the last stall, in ms                     |
+
+A master transaction takes 1.2 ms. One that is still running after 20 ms never
+completes - no callback arrives, the handle stays busy and every following
+transaction is refused, so the link stops until the role is switched or the
+module is reset. That happened twice in 10000 link tests: every byte had been
+sent, HAL waited for two more received bytes, and the receive FIFO held one -
+with the FIFO threshold at two bytes, the interrupt that would have finished
+the transfer never came. The watchdog keeps this record, resets SPI2 and
+releases chip select, which costs one transaction instead of the link.
+
 ### 0x20 CELLS_READ
 
 Request: empty. Answer: 72 bytes of snapshot behind the status byte.
