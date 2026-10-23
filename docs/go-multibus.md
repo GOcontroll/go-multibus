@@ -53,7 +53,7 @@ The order matters, and it is the reason the configuration goes over SPI:
                           └─ has to happen before USB comes up
 ```
 
-## The five states
+## The states
 
 | State       | What happens                                                        |
 |-------------|---------------------------------------------------------------------|
@@ -67,6 +67,16 @@ Every step is idempotent, and the sequence is re-entered from the top whenever
 the module disappears. That is what makes recovery automatic: pull the module
 and put it back, and the service resets, restarts, reconfigures and resumes
 without anyone intervening.
+
+One more state sits outside the sequence: **`held`**. go-modules (3.3.2 and
+later) writes its process id to `/run/gocontroll/module-busy/<slot>` while it
+scans or flashes a slot. A supervisor that finds its slot marked closes the
+protocol port, touches nothing, and waits; when the marker goes - or the process
+that wrote it is gone - it brings the module back from `reset`, because go-modules
+leaves it in its bootloader or in an application nobody has configured. Before this a firmware update fought
+the service: it saw its module vanish halfway through the upload and reset the
+slot, which killed the upload. The other modules keep running: `go-modules
+update 8` only touches slot 8.
 
 With more than one module configured each runs this sequence in its own thread,
 and every line in the journal starts with `slot N: `. A module that is being
@@ -707,6 +717,7 @@ a dead battery link; this way it can.
 | stuck in `enumerate` | The application runs but USB does not come up. Check that the controller port is in host mode. |
 | `running`, `failures` climbing | USB works but polls fail. `journalctl -u go-multibus` has the error text. |
 | `running` but `valid` false | USB is fine and the isoSPI link is not. Use `gocontroll-cellmon status` on the counters. |
+| `held` | go-modules is scanning or flashing this slot. It clears on its own when go-modules exits; a marker in `/run/gocontroll/module-busy/` whose process is gone is ignored. |
 | supply row says `not supported by this firmware` | The module runs a build older than 0.2.0. Everything else works; flash a current image to get the supply. |
 | `firmware older than 0.3.0 cannot be told apart from another module` | More than one module is configured and this one has no `IDENTITY`. Flash 0.3.0 or newer. |
 | role row says `module has ...` | The module runs in another isoSPI role than configured. `fixed by its firmware` means an image older than 0.3.0, which cannot switch. |

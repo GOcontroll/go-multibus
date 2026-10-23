@@ -92,6 +92,9 @@ pub enum State {
     Enumerate,
     Running,
     Failed,
+    /// go-modules is working on the slot - scanning or uploading firmware -
+    /// and the supervisor keeps its hands off until it is done.
+    Held,
 }
 
 impl State {
@@ -103,6 +106,7 @@ impl State {
             State::Enumerate => "enumerate",
             State::Running => "running",
             State::Failed => "failed",
+            State::Held => "held",
         }
     }
 
@@ -115,17 +119,39 @@ impl State {
             State::Enumerate => "waiting for USB",
             State::Running => "running",
             State::Failed => "not reachable - see the log below",
+            State::Held => "held while go-modules works on the slot",
         }
     }
 
-    pub const ALL: [State; 6] = [
+    pub const ALL: [State; 7] = [
         State::Reset,
         State::Start,
         State::Configure,
         State::Enumerate,
         State::Running,
         State::Failed,
+        State::Held,
     ];
+}
+
+/// Where go-modules marks the slots it is working on: one file per slot, holding
+/// its process id. A module reset or a firmware upload runs over the same
+/// module bus this supervisor uses, and a supervisor that saw its module
+/// vanish mid-upload used to reset the slot - which killed the upload, while a
+/// full scan took every module down at once.
+const BUSY_DIR: &str = "/run/gocontroll/module-busy";
+
+/// Whether go-modules is working on `slot` right now. A marker only counts
+/// while the process that wrote it lives, so one left behind by a crash does
+/// not hold the slot forever.
+fn slot_held(slot: u8) -> bool {
+    let Ok(text) = std::fs::read_to_string(format!("{BUSY_DIR}/{slot}")) else {
+        return false;
+    };
+    match text.trim().parse::<u32>() {
+        Ok(pid) => std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        Err(_) => false,
+    }
 }
 
 /// Run a command with a ceiling on how long it may take.
@@ -1121,6 +1147,31 @@ impl Supervisor {
 
     /// Advance the state machine by one bounded piece of work.
     pub fn step(&mut self) {
+        // go-modules is scanning or flashing this slot: stand by, and touch
+        // nothing - not even the protocol port, whose device is about to go.
+        if slot_held(self.config.slot) {
+            if self.state != State::Held {
+                self.log("go-modules is working on this slot; standing by");
+                self.close();
+                self.module_running = false;
+                self.snapshot = None;
+                self.state = State::Held;
+            }
+            self.publish_state();
+            return;
+        }
+        if self.state == State::Held {
+            // go-modules leaves the module in its bootloader or in a freshly
+            // started application that nobody configured, so the daemon goes
+            // through the whole sequence again. The UI only re-attaches; it
+            // never resets hardware on its own.
+            self.log("go-modules is done with this slot; bringing the module back");
+            self.attempts = 0;
+            self.retry_at = None;
+            self.failing_since = None;
+            self.restart(self.auto_reset);
+        }
+
         // Sitting out a back-off after a failed attempt. Returning rather than
         // sleeping keeps a step non-blocking, which is what lets the UI call
         // this from its own loop without going deaf to the keyboard.
@@ -1136,6 +1187,7 @@ impl Supervisor {
             State::Configure => self.do_configure(),
             State::Enumerate => self.do_enumerate(),
             State::Running => self.do_running(),
+            State::Held => Ok(()),
             State::Failed => {
                 // Stay put until asked to retry, unless this supervisor is
                 // allowed to recover on its own.
