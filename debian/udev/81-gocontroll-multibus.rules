@@ -15,14 +15,32 @@
 #   mb_serial1   RS485 1 / RS232  2                     01
 #   mb_serial2   RS485 2          3                     03
 #   mb_serial3   RS485 3          4                     05
+#   mb_protocol  -                5 (isoSPI) + control  07
 #
 # mb_can2 and mb_serial2 are the same connector pins in different modes, as are
 # mb_can3 and mb_serial3. Only one of each pair can be live at a time.
 #
+# More than one module: every name then carries the module's slot, so the
+# module in slot 7 gets mb7_can1..3, /dev/mb7_serial1..3 and /dev/mb7_protocol,
+# and the one in slot 8 the same with mb8_. Plain mb_ names would collide - the
+# second module would keep its kernel names. Nothing in a uevent says which slot
+# a device sits in, so the prefix comes from a map go-multibus writes once it has
+# asked each module for its USB serial number over the module bus:
+#
+#   /run/gocontroll/multibus-usb-names     206435A63245 mb7_
+#   /var/lib/go-multibus/usb-names         the same, kept over a reboot
+#
+# The helper looks the device's serial number up there and prints the prefix;
+# with no map at all - one module configured - it prints mb_, so a controller
+# with one module is named exactly as it always was. See the helper for the
+# details, including why it waits a moment for a serial the map does not have
+# yet.
+#
 # Runs at 81, after 80-can-usb.rules, so it has the last word on the name.
 
 # --- CAN interfaces -----------------------------------------------------------
-# The helper works out which channel this netdev is and prints the name.
+# The helper works out which channel this netdev is, finds the module's prefix,
+# and prints the whole name.
 SUBSYSTEM=="net", ACTION=="add", SUBSYSTEMS=="usb", \
     ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", \
     PROGRAM="/lib/udev/gocontroll-multibus-canname %k", NAME="%c"
@@ -37,15 +55,29 @@ SUBSYSTEM=="net", ACTION=="add", SUBSYSTEMS=="usb", \
 # bInterfaceNumber lives on the USB interface - two different parents, so such a
 # rule silently never matches. The ID_* properties below are all set on the tty
 # device itself by the usb_id builtin that 60-serial.rules runs, so they can be
-# combined freely.
+# combined freely. ID_SERIAL_SHORT is among them: it is the USB serial number,
+# the same string the map is keyed on.
+#
+# The helper prints only the prefix here (mb_ or mb7_), and %c puts it in front
+# of the rest of the name. The interface number is matched before PROGRAM, so
+# the helper runs once per port, not four times.
 SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
-    ENV{ID_USB_INTERFACE_NUM}=="01", SYMLINK+="mb_serial1"
+    ENV{ID_USB_INTERFACE_NUM}=="01", \
+    PROGRAM="/lib/udev/gocontroll-multibus-canname --prefix $env{ID_SERIAL_SHORT}", \
+    SYMLINK+="%cserial1"
 SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
-    ENV{ID_USB_INTERFACE_NUM}=="03", SYMLINK+="mb_serial2"
+    ENV{ID_USB_INTERFACE_NUM}=="03", \
+    PROGRAM="/lib/udev/gocontroll-multibus-canname --prefix $env{ID_SERIAL_SHORT}", \
+    SYMLINK+="%cserial2"
 SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
-    ENV{ID_USB_INTERFACE_NUM}=="05", SYMLINK+="mb_serial3"
+    ENV{ID_USB_INTERFACE_NUM}=="05", \
+    PROGRAM="/lib/udev/gocontroll-multibus-canname --prefix $env{ID_SERIAL_SHORT}", \
+    SYMLINK+="%cserial3"
 
-# Interface 7 is the module protocol, not a serial bridge. /dev/mb_protocol is
-# what the service and the tooling open.
+# Interface 7 is the module protocol, not a serial bridge. /dev/mb_protocol -
+# /dev/mb7_protocol with several modules - is what the service and the tooling
+# open.
 SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
-    ENV{ID_USB_INTERFACE_NUM}=="07", SYMLINK+="mb_protocol"
+    ENV{ID_USB_INTERFACE_NUM}=="07", \
+    PROGRAM="/lib/udev/gocontroll-multibus-canname --prefix $env{ID_SERIAL_SHORT}", \
+    SYMLINK+="%cprotocol"

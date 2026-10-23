@@ -12,11 +12,12 @@
 //!     START        tell the bootloader its firmware is current, so it jumps to
 //!       |          the application. Without this the module sits in the
 //!       |          bootloader forever and never enumerates on USB.
-//!     CONFIGURE    push the interface configuration and the external supply
-//!       |          over the module bus (SPI). This happens over SPI and not
-//!       |          over USB on purpose: the controller has to know which
-//!       |          interfaces are real before it initialises them, and USB is
-//!       |          not up yet at this point.
+//!     CONFIGURE    push the interface configuration, the isoSPI role and the
+//!       |          external supply over the module bus (SPI), and ask the
+//!       |          module who it is. This happens over SPI and not over USB on
+//!       |          purpose: the controller has to know which interfaces are
+//!       |          real before it initialises them, and USB is not up yet at
+//!       |          this point.
 //!     ENUMERATE    wait for the USB device and its four CDC ports. The
 //!       |          descriptor is fixed, so this always yields the same set of
 //!       |          ports regardless of the configuration.
@@ -26,16 +27,26 @@
 //! Every step is idempotent and the whole sequence is re-entered from the top
 //! when the module disappears, which is what makes recovery after a reset or a
 //! re-plug automatic rather than something an operator has to do.
+//!
+//! **One supervisor drives one module.** A controller with several modules
+//! runs one per slot, each in its own thread, and they share nothing but the
+//! name map. With one module configured a supervisor behaves exactly as it did
+//! before there could be more: it takes whichever Multibus device turns up and
+//! uses the `mb_` names. With more than one, it learns its module's USB serial
+//! number over the module bus during CONFIGURE, records it in the name map so
+//! udev names the module's devices after the slot, and in ENUMERATE waits for
+//! that one USB device and no other.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, STATE_PATH};
-use crate::discover;
+use crate::config::{ModuleConfig, ModuleSetup};
+use crate::discover::{self, Names, UsbModule};
 use crate::error::{Error, Result};
 use crate::link::MultibusLink;
-use crate::modulebus::{self, ModuleBus};
-use crate::proto::{CellSnapshot, LinkStatus, Mode, Supply};
+use crate::modulebus::{self, Answer, ModuleBus};
+use crate::namemap;
+use crate::proto::{status, CellSnapshot, Info, LinkStatus, Mode, Role, Supply};
 use crate::shm;
 
 /// How long to wait for USB to enumerate after the application starts. The
@@ -68,6 +79,10 @@ const RETRY_BACKOFF: [Duration; 5] = [
     Duration::from_secs(30),
     Duration::from_secs(60),
 ];
+
+/// Why a module whose firmware has no `IDENTITY` cannot run next to another.
+const TOO_OLD_TO_TELL_APART: &str =
+    "firmware older than 0.3.0 cannot be told apart from another module; update it";
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum State {
@@ -102,6 +117,15 @@ impl State {
             State::Failed => "not reachable - see the log below",
         }
     }
+
+    pub const ALL: [State; 6] = [
+        State::Reset,
+        State::Start,
+        State::Configure,
+        State::Enumerate,
+        State::Running,
+        State::Failed,
+    ];
 }
 
 /// Run a command with a ceiling on how long it may take.
@@ -134,7 +158,16 @@ fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Option<std::pro
 }
 
 pub struct Supervisor {
-    pub config: Config,
+    pub config: ModuleConfig,
+    publish_interval_s: f64,
+
+    /// More than one module configured: the names carry the slot, the
+    /// documents are per slot, and the USB device is the one with this
+    /// module's serial number rather than whichever turns up.
+    multi: bool,
+    names: Names,
+    output: String,
+    state_path: String,
 
     /// Where the sequence begins. The daemon starts at RESET because a
     /// controller boot should leave the module in a known state. The UI starts
@@ -158,14 +191,29 @@ pub struct Supervisor {
     pub snapshot: Option<CellSnapshot>,
     pub link_status: Option<LinkStatus>,
 
+    /// The module's USB serial number, as it reported it over the module bus.
+    /// Only learned with more than one module configured, where it is what
+    /// finds the module's USB device.
+    pub usb_serial: Option<String>,
+    /// The isoSPI role the module last reported running in.
+    pub reported_role: Option<Role>,
+    /// Set when the firmware cannot switch role at runtime (older than
+    /// 0.3.0), so its role is whatever it was built with.
+    pub role_fixed: bool,
+
     link: Option<MultibusLink>,
+    usb_module: Option<UsbModule>,
     /// Set when the module bus would not take something, so the enumerate step
     /// applies it over USB instead.
     configure_over_usb: bool,
     supply_over_usb: bool,
+    role_over_usb: bool,
     /// Set once the module has answered "unknown command" to a supply request,
     /// so an older firmware is reported once rather than on every cycle.
     supply_unsupported: bool,
+    /// The last thing said about the role, so a lasting disagreement is
+    /// logged once rather than on every bring-up.
+    role_note: String,
 
     failing_since: Option<Instant>,
     last_publish: Option<Instant>,
@@ -176,9 +224,17 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(config: Config, log_sink: Box<dyn FnMut(&str)>) -> Supervisor {
+    pub fn new(setup: ModuleSetup, log_sink: Box<dyn FnMut(&str)>) -> Supervisor {
+        let output = setup.output();
+        let state_path = setup.state_path();
+        let names = setup.names();
         Supervisor {
-            config,
+            config: setup.module,
+            publish_interval_s: setup.publish_interval_s,
+            multi: setup.multi,
+            names,
+            output,
+            state_path,
             start_state: State::Reset,
             auto_reset: true,
             link_timeout: crate::link::DEFAULT_TIMEOUT,
@@ -192,10 +248,16 @@ impl Supervisor {
             supply: None,
             snapshot: None,
             link_status: None,
+            usb_serial: None,
+            reported_role: None,
+            role_fixed: false,
             link: None,
+            usb_module: None,
             configure_over_usb: false,
             supply_over_usb: false,
+            role_over_usb: false,
             supply_unsupported: false,
+            role_note: String::new(),
             failing_since: None,
             last_publish: None,
             attempts: 0,
@@ -210,8 +272,8 @@ impl Supervisor {
     /// The shorter link timeout is the point of the distinction: the daemon can
     /// afford to wait, the UI cannot, because every second spent blocking is a
     /// second it does not repaint or read the keyboard.
-    pub fn attached(config: Config, log_sink: Box<dyn FnMut(&str)>) -> Supervisor {
-        let mut supervisor = Supervisor::new(config, log_sink);
+    pub fn attached(setup: ModuleSetup, log_sink: Box<dyn FnMut(&str)>) -> Supervisor {
+        let mut supervisor = Supervisor::new(setup, log_sink);
         supervisor.start_state = State::Enumerate;
         supervisor.state = State::Enumerate;
         supervisor.auto_reset = false;
@@ -219,6 +281,26 @@ impl Supervisor {
         supervisor.link_retries = 0;
         supervisor.enumeration_timeout = Duration::from_millis(500);
         supervisor
+    }
+
+    pub fn slot(&self) -> u8 {
+        self.config.slot
+    }
+
+    pub fn is_multi(&self) -> bool {
+        self.multi
+    }
+
+    pub fn names(&self) -> &Names {
+        &self.names
+    }
+
+    /// Whether the module runs in a role other than the configured one.
+    pub fn role_mismatch(&self) -> bool {
+        matches!(
+            (self.config.isospi_role, self.reported_role),
+            (Some(wanted), Some(reported)) if wanted != reported
+        )
     }
 
     fn log(&mut self, message: impl AsRef<str>) {
@@ -246,6 +328,7 @@ impl Supervisor {
         self.module_running = false;
         self.snapshot = None;
         self.failing_since = None;
+        self.usb_module = None;
     }
 
     // -- individual steps ----------------------------------------------------
@@ -276,11 +359,26 @@ impl Supervisor {
     }
 
     /// Push the configuration over SPI, before USB comes up.
+    ///
+    /// The order is interfaces, role, supply, identity. The interfaces decide
+    /// what Linux is about to see, so they go first; the identity is only
+    /// needed once USB is about to appear, and asking for it last keeps it from
+    /// holding up anything that changes the hardware.
     fn do_configure(&mut self) -> Result<()> {
         let modes = self.config.interface_modes()?;
         let bus = ModuleBus::open(self.config.slot)?;
 
         let Some((accepted, active)) = bus.set_interfaces(&modes)? else {
+            if self.multi {
+                // With several modules the module bus is the only thing that
+                // ties this slot to one of their USB devices, so there is no
+                // USB fallback to be had.
+                return Err(Error::module(format!(
+                    "the application does not answer on the module bus, which is what \
+                     tells this slot's USB device apart from the others; {TOO_OLD_TO_TELL_APART}"
+                )));
+            }
+
             // Not fatal. Firmware built before ModuleBus.c serves the module bus
             // from the bootloader only, so an application that ignores us here
             // may still speak the protocol over USB. Carry on and configure
@@ -290,6 +388,7 @@ impl Supervisor {
             self.log("no module bus answer; will configure over USB instead");
             self.configure_over_usb = true;
             self.supply_over_usb = true;
+            self.role_over_usb = true;
             self.state = State::Enumerate;
             return Ok(());
         };
@@ -311,10 +410,49 @@ impl Supervisor {
             .collect();
         self.log(format!("interfaces configured over SPI: {}", applied.join(",")));
 
+        self.configure_role_over_spi(&bus)?;
         self.configure_supply_over_spi(&bus)?;
+        if self.multi {
+            self.learn_identity_over_spi(&bus)?;
+        }
 
         self.module_running = true;
         self.state = State::Enumerate;
+        Ok(())
+    }
+
+    /// Push the configured isoSPI role over the module bus.
+    ///
+    /// The module does not store its role: after every reset it is back in
+    /// whatever its firmware starts in, which is master on a hardware v2 build
+    /// and slave on a v1 build. So the role is pushed on every bring-up, like
+    /// the interfaces. A one-module file that never set a role pushes nothing
+    /// and leaves the module as it was before 0.3.0 existed.
+    fn configure_role_over_spi(&mut self, bus: &ModuleBus) -> Result<()> {
+        let Some(wanted) = self.config.isospi_role else {
+            return Ok(());
+        };
+
+        match bus.set_role(wanted)? {
+            Answer::Reply((true, active)) => {
+                self.reported_role = Some(active);
+                self.role_fixed = false;
+                self.role_over_usb = false;
+                self.log(format!("isoSPI role {active}"));
+            }
+            Answer::Reply((false, active)) => {
+                // A refusal is about the hardware, not about the transport, so
+                // USB would not do any better.
+                self.reported_role = Some(active);
+                self.role_over_usb = false;
+                self.log(format!(
+                    "the module refused isoSPI role {wanted}; it runs as {active}"
+                ));
+            }
+            // Older firmware, or a module bus that went quiet halfway through.
+            // USB answers an unknown command properly, so settle it there.
+            Answer::Unsupported | Answer::Silent => self.role_over_usb = true,
+        }
         Ok(())
     }
 
@@ -354,6 +492,83 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Ask the module for its USB serial number, and put it in the name map.
+    ///
+    /// Only needed with more than one module, and there it is not optional: the
+    /// serial number is the only way to tell which of the USB devices that are
+    /// about to appear is this slot's.
+    fn learn_identity_over_spi(&mut self, bus: &ModuleBus) -> Result<()> {
+        match bus.identity()? {
+            Answer::Reply(identity) => {
+                self.adopt_serial(identity.serial);
+                Ok(())
+            }
+            Answer::Unsupported => Err(Error::module(TOO_OLD_TO_TELL_APART)),
+            Answer::Silent => Err(Error::module(format!(
+                "slot {} did not answer IDENTITY on the module bus",
+                self.config.slot
+            ))),
+        }
+    }
+
+    /// Take `serial` as this module's, and record it so udev names the
+    /// module's devices after its slot.
+    ///
+    /// Written as early as possible - straight after the module said who it
+    /// is - because USB enumerates at around the same moment, and every device
+    /// udev reaches before the line is there has to be named a second time.
+    fn adopt_serial(&mut self, serial: String) {
+        if self.usb_serial.as_deref() != Some(serial.as_str()) {
+            self.log(format!(
+                "USB serial {serial}, named {}*",
+                self.names.prefix()
+            ));
+        }
+        if let Err(failure) = namemap::record(&serial, self.names.prefix()) {
+            // Not fatal: the module works without its names, it just gets the
+            // wrong ones. The name check after enumeration says so as well.
+            self.log(failure.to_string());
+        }
+        self.usb_serial = Some(serial);
+    }
+
+    /// This module's USB serial number, learning it if need be.
+    ///
+    /// The daemon learns it in CONFIGURE. The UI attaches at ENUMERATE and
+    /// never ran that step, so it asks now: the module bus answers while the
+    /// application runs, and `IDENTITY` changes nothing. Where the module bus
+    /// is not reachable the name map, which the service wrote when it brought
+    /// the module up, is the fallback.
+    fn known_serial(&mut self) -> Result<String> {
+        if let Some(serial) = &self.usb_serial {
+            return Ok(serial.clone());
+        }
+
+        if let Ok(bus) = ModuleBus::open(self.config.slot) {
+            match bus.identity() {
+                Ok(Answer::Reply(identity)) => {
+                    let serial = identity.serial.clone();
+                    self.adopt_serial(identity.serial);
+                    return Ok(serial);
+                }
+                Ok(Answer::Unsupported) => return Err(Error::module(TOO_OLD_TO_TELL_APART)),
+                _ => {}
+            }
+        }
+
+        if let Some(serial) = namemap::serial_for_prefix(self.names.prefix()) {
+            self.usb_serial = Some(serial.clone());
+            return Ok(serial);
+        }
+
+        Err(Error::module(format!(
+            "cannot tell which USB device is slot {}'s: the module bus does not answer \
+             and the name map has no entry for {}. Resetting the module asks it again.",
+            self.config.slot,
+            self.names.prefix()
+        )))
+    }
+
     /// Why nothing enumerated, naming the OTG port when that is the reason.
     ///
     /// Worth the extra file read at the one moment it is needed: "check that
@@ -362,17 +577,21 @@ impl Supervisor {
     /// gadget — which no cable, module or reset is going to fix.
     fn enumeration_failure(&self) -> Error {
         let seconds = self.enumeration_timeout.as_secs_f64();
+        let subject = match (&self.usb_serial, self.multi) {
+            (Some(serial), true) => format!("the module with USB serial {serial}"),
+            _ => "the module".to_string(),
+        };
         match discover::otg_dr_mode() {
             None => Error::module(format!(
-                "the module did not enumerate on USB within {seconds:.1}s. Check that \
+                "{subject} did not enumerate on USB within {seconds:.1}s. Check that \
                  the controller USB port is in host mode."
             )),
             Some(mode) if mode == "host" => Error::module(format!(
-                "the module did not enumerate on USB within {seconds:.1}s. Check that \
+                "{subject} did not enumerate on USB within {seconds:.1}s. Check that \
                  the controller USB port is in host mode."
             )),
             Some(mode) => Error::module(format!(
-                "the module did not enumerate on USB within {seconds:.1}s because the \
+                "{subject} did not enumerate on USB within {seconds:.1}s because the \
                  controller's OTG port booted in {mode} mode, not host. No module can \
                  enumerate until that is fixed: run `gocontroll-usb-hostmode --apply` \
                  and reboot."
@@ -380,10 +599,9 @@ impl Supervisor {
         }
     }
 
-    /// Wait for USB, then open the protocol port and finish the configuration.
-    fn do_enumerate(&mut self) -> Result<()> {
-        let deadline = Instant::now() + self.enumeration_timeout;
-
+    /// One module: wait for the protocol port of whichever Multibus device
+    /// turns up, and open it.
+    fn open_only_port(&mut self, deadline: Instant) -> Result<MultibusLink> {
         loop {
             if discover::enumerate_ports()
                 .iter()
@@ -414,12 +632,59 @@ impl Supervisor {
         // sequence away and started over - visible at boot as an "enumerate
         // failed: No such device" followed by a second, successful pass.
         // Retrying until the deadline rides it out.
-        let mut link = loop {
+        loop {
             match MultibusLink::open_path(
                 &discover::find_protocol_port()?,
                 self.link_timeout,
                 self.link_retries,
             ) {
+                Ok(link) => return Ok(link),
+                Err(failure) => {
+                    if Instant::now() >= deadline {
+                        return Err(Error::module(format!(
+                            "the protocol port did not become usable within {:.1}s ({failure})",
+                            self.enumeration_timeout.as_secs_f64()
+                        )));
+                    }
+                    std::thread::sleep(ENUMERATION_POLL);
+                }
+            }
+        }
+    }
+
+    /// Several modules: wait for this module's own USB device - the one with
+    /// the serial number it reported over the module bus - and open its
+    /// protocol port. Any other module's devices are none of this
+    /// supervisor's business, however they are named.
+    fn open_own_port(&mut self, deadline: Instant) -> Result<MultibusLink> {
+        let serial = self.known_serial()?;
+
+        let module = loop {
+            if let Some(module) = discover::find_usb_module(&serial) {
+                if discover::module_protocol_port(&module).is_some() {
+                    break module;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(self.enumeration_failure());
+            }
+            std::thread::sleep(ENUMERATION_POLL);
+        };
+
+        self.ensure_names(&module);
+
+        // Opening is part of the wait, for the same reason as with one module.
+        let link = loop {
+            let opened = discover::module_protocol_path(&module, &self.names)
+                .ok_or_else(|| {
+                    Error::module(format!(
+                        "the module with USB serial {serial} lost its protocol port"
+                    ))
+                })
+                .and_then(|path| {
+                    MultibusLink::open_path(&path, self.link_timeout, self.link_retries)
+                });
+            match opened {
                 Ok(link) => break link,
                 Err(failure) => {
                     if Instant::now() >= deadline {
@@ -431,6 +696,156 @@ impl Supervisor {
                     std::thread::sleep(ENUMERATION_POLL);
                 }
             }
+        };
+
+        self.usb_module = Some(module);
+        Ok(link)
+    }
+
+    /// Make sure udev named this module's devices after its slot.
+    ///
+    /// udev can only name a module by the name map, and the module's line only
+    /// goes in once the module has told the service its serial number - which
+    /// happens at about the moment USB enumerates. Whatever udev reached first
+    /// got the single-module names, or kept its kernel name where another
+    /// module already had those. That is put right here, by having udev
+    /// process exactly those devices again now that the map has the line. The
+    /// CAN interfaces are still down at this point, which is what lets a
+    /// rename succeed; nothing of another module is touched.
+    fn ensure_names(&mut self, module: &UsbModule) {
+        if !discover::udev_names_expected() {
+            return;
+        }
+        run_bounded("udevadm", &["settle", "--timeout=5"], Duration::from_secs(10));
+
+        let wrong = discover::misnamed(module, &self.names);
+        if wrong.is_empty() {
+            return;
+        }
+
+        let listed: Vec<String> = wrong
+            .iter()
+            .map(|device| format!("{} -> {}", device.current, device.expected))
+            .collect();
+        self.log(format!(
+            "renaming what udev named before the name map had this module: {}",
+            listed.join(", ")
+        ));
+
+        let mut args: Vec<&str> = vec!["trigger", "--action=add"];
+        args.extend(wrong.iter().map(|device| device.sysfs.as_str()));
+        run_bounded("udevadm", &args, Duration::from_secs(10));
+        run_bounded("udevadm", &["settle", "--timeout=5"], Duration::from_secs(10));
+
+        let still: Vec<String> = discover::misnamed(module, &self.names)
+            .iter()
+            .map(|device| format!("{} (should be {})", device.current, device.expected))
+            .collect();
+        if !still.is_empty() {
+            self.log(format!(
+                "udev did not rename {}; check {} and 81-gocontroll-multibus.rules",
+                still.join(", "),
+                namemap::RUN_PATH
+            ));
+        }
+    }
+
+    /// Confirm over USB that the port belongs to the module in this slot.
+    ///
+    /// The device was found by the serial number the module bus reported, so
+    /// a disagreement here means the map or sysfs pointed somewhere else -
+    /// and driving another slot's module as this one would configure the wrong
+    /// hardware. Refused outright.
+    fn check_identity_over_usb(&mut self, link: &mut MultibusLink) -> Result<()> {
+        let expected = self.usb_serial.clone().unwrap_or_default();
+        let identity = link.identity().map_err(|failure| {
+            if failure.is_unknown_command() {
+                Error::module(TOO_OLD_TO_TELL_APART)
+            } else {
+                failure
+            }
+        })?;
+        if identity.serial != expected {
+            return Err(Error::module(format!(
+                "{} answers as USB serial {}, but slot {} has {expected}; not using it",
+                link.device(),
+                identity.serial,
+                self.config.slot
+            )));
+        }
+        Ok(())
+    }
+
+    /// Apply the role over USB when SPI could not, then read back what the
+    /// module runs as.
+    ///
+    /// A firmware older than 0.3.0 answers "unknown command" to both role
+    /// commands. Its role is then the one it was built with, which the INFO
+    /// answer reports; a disagreement with the configuration is logged once and
+    /// shown, not treated as a failure, because everything but the cell data
+    /// works in either role.
+    fn settle_role(&mut self, link: &mut MultibusLink, info: &Info) -> Result<()> {
+        let Some(wanted) = self.config.isospi_role else {
+            // No role configured: report what the firmware started in, change
+            // nothing - exactly what happened before 0.3.0.
+            self.reported_role = info.role();
+            return Ok(());
+        };
+
+        if self.role_over_usb {
+            match link.set_role(wanted) {
+                Ok(active) => {
+                    self.role_fixed = false;
+                    self.log(format!("isoSPI role {active} (over USB)"));
+                }
+                Err(failure) if failure.is_unknown_command() => self.role_fixed = true,
+                Err(failure) if failure.is_status(status::BAD_PARAMETER) => {
+                    self.log(format!("the module refused isoSPI role {wanted}"))
+                }
+                Err(failure) => return Err(failure),
+            }
+            self.role_over_usb = false;
+        }
+
+        self.reported_role = match link.get_role() {
+            Ok(role) => {
+                self.role_fixed = false;
+                Some(role)
+            }
+            Err(failure) if failure.is_unknown_command() => {
+                self.role_fixed = true;
+                info.role()
+            }
+            Err(failure) => return Err(failure),
+        };
+
+        let note = match self.reported_role {
+            Some(role) if role != wanted && self.role_fixed => format!(
+                "the module runs as isoSPI {role} and its firmware cannot switch to {wanted}; \
+                 flash 0.3.0 or newer"
+            ),
+            Some(role) if role != wanted => {
+                format!("the module runs as isoSPI {role}, configured is {wanted}")
+            }
+            _ => String::new(),
+        };
+        if note != self.role_note {
+            if !note.is_empty() {
+                self.log(&note);
+            }
+            self.role_note = note;
+        }
+        Ok(())
+    }
+
+    /// Wait for USB, then open the protocol port and finish the configuration.
+    fn do_enumerate(&mut self) -> Result<()> {
+        let deadline = Instant::now() + self.enumeration_timeout;
+
+        let mut link = if self.multi {
+            self.open_own_port(deadline)?
+        } else {
+            self.open_only_port(deadline)?
         };
 
         let device = link.device().to_string();
@@ -455,6 +870,12 @@ impl Supervisor {
             info.hardware_name(),
             info.software_name()
         ));
+
+        if self.multi {
+            self.check_identity_over_usb(&mut link)?;
+        }
+
+        self.settle_role(&mut link, &info)?;
 
         // Fall back to configuring over USB when the module bus would not take
         // it. Failing here is fatal: at this point the module clearly does
@@ -541,6 +962,26 @@ impl Supervisor {
         Ok(())
     }
 
+    /// This module's CAN interfaces in channel order, once udev has given them
+    /// the names they should have - or as they are when the deadline passes.
+    fn own_can_interfaces(&self, module: &UsbModule) -> Vec<String> {
+        let deadline = Instant::now() + UDEV_SETTLE;
+        loop {
+            let present = discover::module_can_interfaces(module);
+            let named = present
+                .iter()
+                .enumerate()
+                .all(|(channel, name)| *name == self.names.can(channel));
+            if (present.len() >= 3 && named)
+                || !discover::udev_names_expected()
+                || Instant::now() >= deadline
+            {
+                return present;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Bring up only the CAN interfaces that have a transceiver behind them.
     ///
     /// The bus parameters are go-can's to decide, not ours — it is the
@@ -553,7 +994,18 @@ impl Supervisor {
         // races with the renames; this waits for the events themselves.
         run_bounded("udevadm", &["settle", "--timeout=5"], Duration::from_secs(10));
 
-        let interfaces = discover::enumerate_can_interfaces(UDEV_SETTLE);
+        // With several modules only this module's own netdevs are candidates,
+        // found under its USB device; the system-wide lookup would find every
+        // module's.
+        let own = match (&self.usb_module, self.multi) {
+            (Some(module), true) => Some(module.clone()),
+            _ => None,
+        };
+        let interfaces = match &own {
+            Some(module) => self.own_can_interfaces(module),
+            None => discover::enumerate_can_interfaces(UDEV_SETTLE),
+        };
+
         if interfaces.len() < 3 {
             let found = if interfaces.is_empty() {
                 "none".to_string()
@@ -569,6 +1021,18 @@ impl Supervisor {
 
         for channel in self.config.can_channels()? {
             let name = interfaces[channel].clone();
+
+            // A netdev still on the wrong name is about to be renamed, or
+            // failed to be. Raising it would block the rename for good, since
+            // an interface cannot be renamed while it is up.
+            if own.is_some() && discover::udev_names_expected() {
+                let expected = self.names.can(channel);
+                if name != expected {
+                    self.log(format!("{name} is not named {expected}; not touching it"));
+                    continue;
+                }
+            }
+
             if self.apply_can_with_go_can(&name) {
                 continue;
             }
@@ -615,7 +1079,7 @@ impl Supervisor {
     }
 
     fn do_running(&mut self) -> Result<()> {
-        let interval = Duration::from_secs_f64(self.config.publish_interval_s.max(0.0));
+        let interval = Duration::from_secs_f64(self.publish_interval_s.max(0.0));
         if let Some(last) = self.last_publish {
             if last.elapsed() < interval {
                 return Ok(());
@@ -645,7 +1109,7 @@ impl Supervisor {
             "read_failures": self.failures,
             "last_error": self.last_error,
         });
-        shm::write_atomic(&self.config.output, &document)?;
+        shm::write_atomic(&self.output, &document)?;
 
         self.failures = 0;
         self.last_error.clear();
@@ -723,7 +1187,7 @@ impl Supervisor {
         // tell a dead service from a dead battery link.
         let document =
             shm::failure_document(self.state.as_str(), self.failures, &self.last_error);
-        let _ = shm::write_atomic(&self.config.output, &document);
+        let _ = shm::write_atomic(&self.output, &document);
 
         // Failing inside RUNNING gets a grace period, because a single dropped
         // poll is not a reason to reset a working module. Failing during
@@ -762,7 +1226,7 @@ impl Supervisor {
     }
 
     fn publish_state(&mut self) {
-        let document = shm::state_document(
+        let mut document = shm::state_document(
             self.state.as_str(),
             self.config.slot,
             self.module_running,
@@ -771,7 +1235,16 @@ impl Supervisor {
             self.failures,
             &self.last_error,
         );
-        let _ = shm::write_atomic(STATE_PATH, &document);
+        // With one module the document stays exactly as it was before 0.3.0,
+        // so nothing that reads it has to change.
+        if self.multi {
+            document["isospi_role"] = serde_json::json!({
+                "configured": self.config.isospi_role.map(Role::as_str),
+                "reported": self.reported_role.map(Role::as_str),
+            });
+            document["usb_serial"] = serde_json::json!(self.usb_serial);
+        }
+        let _ = shm::write_atomic(&self.state_path, &document);
     }
 
     // -- operations the UI drives --------------------------------------------
@@ -791,5 +1264,43 @@ impl Supervisor {
         let supply = link.set_supply(enabled, millivolts)?;
         self.supply = Some(supply);
         Ok(supply)
+    }
+
+    /// Switch the isoSPI role of a module that is already running.
+    ///
+    /// No reset either: the module switches on the spot. It does not store
+    /// the role, but the configuration does, and every bring-up pushes it.
+    pub fn apply_role(&mut self, role: Role) -> Result<Role> {
+        let Some(link) = self.link.as_mut() else {
+            return Err(Error::module(
+                "the module is not reachable; the role is stored and will be \
+                 applied on the next bring-up",
+            ));
+        };
+
+        match link.set_role(role) {
+            Ok(active) => {
+                self.reported_role = Some(active);
+                self.role_fixed = false;
+                self.role_note.clear();
+                Ok(active)
+            }
+            Err(failure) if failure.is_unknown_command() => {
+                self.role_fixed = true;
+                Err(Error::module(
+                    "this firmware cannot switch its isoSPI role; flash 0.3.0 or newer. \
+                     The role is stored and pushed once it can.",
+                ))
+            }
+            Err(failure) if failure.is_status(status::BAD_PARAMETER) => {
+                let active = link.get_role().ok();
+                self.reported_role = active.or(self.reported_role);
+                Err(Error::module(match active {
+                    Some(active) => format!("the module refused {role}; it runs as {active}"),
+                    None => format!("the module refused {role}"),
+                }))
+            }
+            Err(failure) => Err(failure),
+        }
     }
 }

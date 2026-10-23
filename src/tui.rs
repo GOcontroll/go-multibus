@@ -9,6 +9,10 @@
 //! [`crate::service::Supervisor`] — with one difference: this supervisor
 //! attaches to a running module instead of resetting one, so opening the UI to
 //! look at a machine does not interrupt it. `r` asks for a reset explicitly.
+//!
+//! With more than one module configured there is one supervisor per module,
+//! all of them looked after on every idle tick, and Tab moves the screen from
+//! one to the next. The header says which module the list is about.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -24,9 +28,9 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 
-use crate::config::{Config, CONFIG_PATH};
+use crate::config::{store_module, Config, CONFIG_PATH};
 use crate::error::{Error, Result};
-use crate::proto::{format_volts, Mode, Supply, INTERFACES};
+use crate::proto::{format_volts, Mode, Role, Supply, INTERFACES};
 use crate::service::{State, Supervisor};
 
 const SEP: &str = "  ------------------------------------\r\n";
@@ -47,21 +51,29 @@ const LOG_SHOWN: usize = 6;
 /// idle UI costs nothing.
 const TICK: Duration = Duration::from_millis(200);
 
-/// The rows of the main list: the five connector interfaces, then the supply.
+/// The rows of the main list: the five connector interfaces, the isoSPI role
+/// right under interface 5 it belongs to, then the supply.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Row {
     Interface(usize),
+    Role,
     Supply,
 }
 
-const ROWS: [Row; 6] = [
+const ROWS: [Row; 7] = [
     Row::Interface(0),
     Row::Interface(1),
     Row::Interface(2),
     Row::Interface(3),
     Row::Interface(4),
+    Row::Role,
     Row::Supply,
 ];
+
+/// Where a row sits in the list, for putting the cursor back after a picker.
+fn row_index(row: Row) -> usize {
+    ROWS.iter().position(|candidate| *candidate == row).unwrap_or(0)
+}
 
 enum View {
     List {
@@ -69,6 +81,10 @@ enum View {
     },
     PickMode {
         row: usize,
+        cursor: usize,
+        error: Option<String>,
+    },
+    PickRole {
         cursor: usize,
         error: Option<String>,
     },
@@ -82,6 +98,16 @@ enum View {
 enum Action {
     Update(View),
     Quit,
+}
+
+type Log = Rc<RefCell<VecDeque<String>>>;
+
+/// One module on screen: its supervisor and the log lines it has produced.
+/// Each module keeps its own log, so what is under the list is always about the
+/// module the list is about.
+struct Attached {
+    supervisor: Supervisor,
+    log: Log,
 }
 
 /// One choice in the supply picker: off, or a setpoint the module accepts.
@@ -103,26 +129,42 @@ impl SupplyChoice {
 pub fn run(config_path: &str) -> Result<()> {
     let config = Config::load(config_path)?;
 
-    let log: Rc<RefCell<VecDeque<String>>> = Rc::new(RefCell::new(VecDeque::new()));
-    let sink = {
-        let log = Rc::clone(&log);
-        Box::new(move |message: &str| {
-            let mut lines = log.borrow_mut();
-            lines.push_back(message.to_string());
-            while lines.len() > LOG_KEPT {
-                lines.pop_front();
+    let mut modules: Vec<Attached> = config
+        .setups()
+        .into_iter()
+        .map(|setup| {
+            let log: Log = Rc::new(RefCell::new(VecDeque::new()));
+            let sink = {
+                let log = Rc::clone(&log);
+                Box::new(move |message: &str| {
+                    let mut lines = log.borrow_mut();
+                    lines.push_back(message.to_string());
+                    while lines.len() > LOG_KEPT {
+                        lines.pop_front();
+                    }
+                })
+            };
+            Attached {
+                supervisor: Supervisor::attached(setup, sink),
+                log,
             }
         })
-    };
+        .collect();
 
-    let mut supervisor = Supervisor::attached(config, sink);
+    let mut selected = 0usize;
     let mut view = View::List { cursor: 0 };
     let mut stdout = io::stdout();
 
     terminal::enable_raw_mode()?;
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
-    let result = event_loop(&mut stdout, &mut supervisor, &mut view, &log, config_path);
+    let result = event_loop(
+        &mut stdout,
+        &mut modules,
+        &mut selected,
+        &mut view,
+        config_path,
+    );
 
     let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
@@ -132,18 +174,33 @@ pub fn run(config_path: &str) -> Result<()> {
 
 fn event_loop(
     stdout: &mut impl Write,
-    supervisor: &mut Supervisor,
+    modules: &mut [Attached],
+    selected: &mut usize,
     view: &mut View,
-    log: &Rc<RefCell<VecDeque<String>>>,
     config_path: &str,
 ) -> Result<()> {
+    let several = modules.len() > 1;
+
     loop {
-        draw(stdout, supervisor, view, log)?;
+        let shown = &modules[*selected];
+        draw(stdout, &shown.supervisor, view, &shown.log, several)?;
 
         if event::poll(TICK)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // Tab moves to the next module from the list and from the
+                    // cell view; inside a picker it would leave a half-made
+                    // choice behind, so it is ignored there.
+                    if key.code == KeyCode::Tab
+                        && several
+                        && matches!(view, View::List { .. } | View::Cells)
+                    {
+                        *selected = (*selected + 1) % modules.len();
+                        continue;
+                    }
+
                     let current = std::mem::replace(view, View::List { cursor: 0 });
+                    let supervisor = &mut modules[*selected].supervisor;
                     match handle_key(key.code, current, supervisor, config_path) {
                         Action::Update(next) => *view = next,
                         Action::Quit => return Ok(()),
@@ -152,9 +209,12 @@ fn event_loop(
                 _ => {}
             }
         } else {
-            // No key waiting, so let the module be looked after. Every step is
+            // No key waiting, so let the modules be looked after - all of them,
+            // so the ones not on screen keep publishing too. Every step is
             // bounded, which is what keeps the keyboard responsive.
-            supervisor.step();
+            for module in modules.iter_mut() {
+                module.supervisor.step();
+            }
         }
     }
 }
@@ -221,6 +281,35 @@ fn handle_key(
             }
         }
 
+        View::PickRole { mut cursor, error } => match key {
+            KeyCode::Up => {
+                cursor = cursor.saturating_sub(1);
+                Action::Update(View::PickRole { cursor, error: None })
+            }
+            KeyCode::Down => {
+                if cursor + 1 < Role::ALL.len() {
+                    cursor += 1;
+                }
+                Action::Update(View::PickRole { cursor, error: None })
+            }
+            KeyCode::Enter => {
+                let role = Role::ALL[cursor.min(Role::ALL.len() - 1)];
+                match apply_role(supervisor, config_path, role) {
+                    Ok(()) => Action::Update(View::List {
+                        cursor: row_index(Row::Role),
+                    }),
+                    Err(failure) => Action::Update(View::PickRole {
+                        cursor,
+                        error: Some(failure.to_string()),
+                    }),
+                }
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => Action::Update(View::List {
+                cursor: row_index(Row::Role),
+            }),
+            _ => Action::Update(View::PickRole { cursor, error }),
+        },
+
         View::PickSupply { mut cursor, error } => {
             let choices = supply_choices(supervisor.supply);
             match key {
@@ -238,7 +327,7 @@ fn handle_key(
                     let choice = choices[cursor.min(choices.len().saturating_sub(1))];
                     match apply_supply(supervisor, config_path, choice) {
                         Ok(()) => Action::Update(View::List {
-                            cursor: ROWS.len() - 1,
+                            cursor: row_index(Row::Supply),
                         }),
                         Err(failure) => Action::Update(View::PickSupply {
                             cursor,
@@ -247,7 +336,7 @@ fn handle_key(
                     }
                 }
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => Action::Update(View::List {
-                    cursor: ROWS.len() - 1,
+                    cursor: row_index(Row::Supply),
                 }),
                 _ => Action::Update(View::PickSupply { cursor, error }),
             }
@@ -277,6 +366,18 @@ fn open_picker(cursor: usize, supervisor: &Supervisor) -> View {
                 .unwrap_or(0);
             View::PickMode {
                 row: index,
+                cursor: start,
+                error: None,
+            }
+        }
+        Row::Role => {
+            // Start on the configured role; with none configured, on the one
+            // the module reports, so Enter alone pins down what it already is.
+            let current = supervisor.config.isospi_role.or(supervisor.reported_role);
+            let start = current
+                .and_then(|role| Role::ALL.iter().position(|choice| *choice == role))
+                .unwrap_or(0);
+            View::PickRole {
                 cursor: start,
                 error: None,
             }
@@ -329,9 +430,20 @@ fn apply_mode(
 ) -> Result<()> {
     let number = INTERFACES[index].number;
     supervisor.config.set_interface(number, mode)?;
-    supervisor.config.save(config_path)?;
+    store_module(config_path, &supervisor.config)?;
     supervisor.restart(true);
     Ok(())
+}
+
+/// Store an isoSPI role and switch the module to it straight away.
+///
+/// No restart, like the supply: the module changes role on the spot. It does
+/// not keep the role over a reset, but the file does, and every bring-up
+/// pushes it again.
+fn apply_role(supervisor: &mut Supervisor, config_path: &str, role: Role) -> Result<()> {
+    supervisor.config.isospi_role = Some(role);
+    store_module(config_path, &supervisor.config)?;
+    supervisor.apply_role(role).map(|_| ())
 }
 
 /// Store a supply setting and apply it straight away.
@@ -352,7 +464,7 @@ fn apply_supply(
 
     supervisor.config.supply_enabled = enabled;
     supervisor.config.supply_mv = millivolts;
-    supervisor.config.save(config_path)?;
+    store_module(config_path, &supervisor.config)?;
 
     supervisor.apply_supply(enabled, millivolts).map(|_| ())
 }
@@ -363,7 +475,8 @@ fn draw(
     stdout: &mut impl Write,
     supervisor: &Supervisor,
     view: &View,
-    log: &Rc<RefCell<VecDeque<String>>>,
+    log: &Log,
+    several: bool,
 ) -> Result<()> {
     queue!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
 
@@ -389,8 +502,16 @@ fn draw(
         SetForegroundColor(state_colour),
         Print(supervisor.state.label()),
         ResetColor,
-        Print("\r\n"),
     )?;
+    if several {
+        queue!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print("   Tab next module"),
+            ResetColor,
+        )?;
+    }
+    queue!(stdout, Print("\r\n"))?;
     queue!(stdout, Print(SEP))?;
 
     match view {
@@ -400,6 +521,9 @@ fn draw(
         }
         View::PickMode { row, cursor, error } => {
             draw_mode_picker(stdout, supervisor, *row, *cursor, error.as_deref())?
+        }
+        View::PickRole { cursor, error } => {
+            draw_role_picker(stdout, supervisor, *cursor, error.as_deref())?
         }
         View::PickSupply { cursor, error } => {
             draw_supply_picker(stdout, supervisor, *cursor, error.as_deref())?
@@ -516,6 +640,18 @@ fn draw_list(stdout: &mut impl Write, supervisor: &Supervisor, cursor: usize) ->
                 }
             }
 
+            Row::Role => {
+                // "default" when a one-module file never set a role: the module
+                // then keeps whatever its firmware starts in.
+                let configured = supervisor.config.isospi_role;
+                let text = configured.map(Role::as_str).unwrap_or("default");
+
+                queue!(stdout, Print(format!("{:<14}", "isoSPI role")))?;
+                queue!(stdout, Print(format!("{:<9}", "")))?;
+                value(stdout, text, selected, configured.is_some())?;
+                draw_role_note(stdout, supervisor)?;
+            }
+
             Row::Supply => {
                 let range = match supervisor.supply {
                     Some(supply) => format!(
@@ -550,6 +686,40 @@ fn draw_list(stdout: &mut impl Write, supervisor: &Supervisor, cursor: usize) ->
         stdout,
         "\u{2191}/\u{2193} navigate   Enter select   c cells   r restart   q quit",
     )?;
+    Ok(())
+}
+
+/// The trailing note on the role row: whether the module agrees, and what it
+/// runs as when no role is configured.
+fn draw_role_note(stdout: &mut impl Write, supervisor: &Supervisor) -> Result<()> {
+    let Some(reported) = supervisor.reported_role else {
+        return Ok(());
+    };
+
+    match supervisor.config.isospi_role {
+        Some(wanted) if wanted != reported => {
+            let text = if supervisor.role_fixed {
+                format!("module has {reported}, fixed by its firmware")
+            } else {
+                format!("module has {reported}")
+            };
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Red),
+                Print(text),
+                ResetColor
+            )?;
+        }
+        Some(_) => {}
+        None => {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("module runs as {reported}")),
+                ResetColor,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -598,7 +768,7 @@ fn draw_supply_note(stdout: &mut impl Write, supervisor: &Supervisor) -> Result<
     Ok(())
 }
 
-fn draw_log(stdout: &mut impl Write, log: &Rc<RefCell<VecDeque<String>>>) -> Result<()> {
+fn draw_log(stdout: &mut impl Write, log: &Log) -> Result<()> {
     let lines = log.borrow();
     if lines.is_empty() {
         return Ok(());
@@ -656,6 +826,43 @@ fn draw_mode_picker(
             ResetColor,
         )?;
     }
+
+    draw_error(stdout, error)
+}
+
+fn draw_role_picker(
+    stdout: &mut impl Write,
+    supervisor: &Supervisor,
+    cursor: usize,
+    error: Option<&str>,
+) -> Result<()> {
+    queue!(
+        stdout,
+        Print("  isoSPI role  \u{2014}  Select Role\r\n\r\n")
+    )?;
+
+    for (index, role) in Role::ALL.iter().enumerate() {
+        draw_choice(
+            stdout,
+            role.as_str(),
+            index == cursor,
+            supervisor.config.isospi_role == Some(*role),
+        )?;
+    }
+
+    hint(
+        stdout,
+        "\u{2191}/\u{2193} navigate   Enter apply   \u{2190}/Esc back",
+    )?;
+
+    queue!(
+        stdout,
+        Print("\r\n"),
+        SetForegroundColor(Color::DarkGrey),
+        Print("  The master drives the isoSPI link, the slave answers it. The module\r\n"),
+        Print("  switches straight away; the controller pushes the role on every bring-up.\r\n"),
+        ResetColor,
+    )?;
 
     draw_error(stdout, error)
 }
@@ -927,6 +1134,13 @@ mod tests {
         let choices = supply_choices(None);
         assert_eq!(choices.first(), Some(&SupplyChoice::Off));
         assert_eq!(choices.last(), Some(&SupplyChoice::Volts(15000)));
+    }
+
+    #[test]
+    fn the_role_row_sits_between_interface_5_and_the_supply() {
+        assert_eq!(row_index(Row::Interface(4)) + 1, row_index(Row::Role));
+        assert_eq!(row_index(Row::Role) + 1, row_index(Row::Supply));
+        assert_eq!(row_index(Row::Supply), ROWS.len() - 1);
     }
 
     #[test]

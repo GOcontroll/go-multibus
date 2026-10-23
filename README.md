@@ -5,8 +5,9 @@ GOcontroll Multibus module service and utilities for Moduline controllers
 
 Brings a Multibus module up after a controller boot, configures which physical
 interface each connector pin pair carries, sets the external supply on the
-connector, and publishes the battery cell voltages it reads over isoSPI to
-`/dev/shm` for the rest of the system.
+connector and the module's end of the isoSPI link, and publishes the battery
+cell voltages it reads over isoSPI to `/dev/shm` for the rest of the system.
+A controller can carry more than one module; each is brought up on its own.
 
 Two faces over one state machine: a background service that runs at boot, and a
 terminal UI for commissioning a machine. What the UI shows is what the service
@@ -24,20 +25,26 @@ gocontroll-usb-hostmode --apply          # put it in host mode (needs a reboot)
 
 go-multibus                              # interactive UI (no arguments)
 go-multibus daemon                       # background service, systemd entry
-go-multibus status                       # one-shot summary, scriptable
+go-multibus status                       # one-shot summary of every module
 go-multibus config                       # show the stored configuration
 go-multibus set 3 can                    # change one interface, store it
 go-multibus supply 9V                    # external supply: store and apply
 go-multibus supply off
-go-multibus ports                        # which ports and CAN interfaces exist
+go-multibus role slave                   # isoSPI role: store and apply
+go-multibus module add 7                 # configure a second module
+go-multibus module remove 7
+go-multibus ports                        # modules, ports and CAN interfaces
 
-gocontroll-cellmon list                  # which Multibus devices are present
+gocontroll-cellmon list                  # which Multibus modules are present
 gocontroll-cellmon info                  # identity, role, capabilities
+gocontroll-cellmon identity              # USB serial number and chip UID
 gocontroll-cellmon status                # isoSPI link counters
 gocontroll-cellmon cells                 # one cell snapshot
 gocontroll-cellmon watch                 # keep printing snapshots
 gocontroll-cellmon interfaces --set can,rs485,can,rs485,isospi
 gocontroll-cellmon supply 9V             # external supply, over USB
+gocontroll-cellmon role slave            # isoSPI role, until the next reset
+gocontroll-cellmon link-test --count 500 --min 1 --max 80
 gocontroll-cellmon raw 03 60 f4 6c       # raw isoSPI transfer
 gocontroll-cellmon serve                 # publish to /dev/shm
 
@@ -45,7 +52,15 @@ gocontroll-modulebus 8 probe             # module bus handshake, over SPI
 gocontroll-modulebus 8 start             # bootloader -> application
 gocontroll-modulebus 8 interfaces        # read/write config over SPI
 gocontroll-modulebus 8 supply 9V         # external supply, before USB exists
+gocontroll-modulebus 8 role              # isoSPI role, over SPI
+gocontroll-modulebus 8 identity          # USB serial number, over SPI
 ```
+
+With more than one module configured, `set`, `supply` and `role` need
+`--slot N` to say which module they are about (`go-multibus set --slot 7 3 can`);
+with one it may be left out. `status --slot N` shows one module. For
+`gocontroll-cellmon`, `--slot N` or `--serial <usb-serial>` picks the module
+when several are present.
 
 Only one of `go-multibus daemon` and the UI can run at a time: both open the
 module's protocol port, and two processes on one CDC port read each other's
@@ -66,12 +81,14 @@ answers. The UI refuses to start while the service is active and says so.
 |-------------|-----------------------------------------------------------------|
 | `reset`     | Pulse the slot reset line; the STM32 restarts into the bootloader |
 | `start`     | Tell the bootloader its firmware is current so it starts the application |
-| `configure` | Push the five interface modes and the external supply over the module bus |
+| `configure` | Push the five interface modes, the isoSPI role and the external supply over the module bus, and ask the module for its USB serial number |
 | `enumerate` | Wait for USB, open the protocol port, apply the cell configuration |
 | `running`   | Poll the cell snapshot and publish it                            |
 
 Every step is idempotent and the sequence restarts from the top when the module
-disappears, so pulling a module and putting it back recovers on its own.
+disappears, so pulling a module and putting it back recovers on its own. With
+several modules each runs this sequence in its own thread, so one module being
+reset never holds up another one's data.
 
 The configuration goes over SPI rather than USB because the controller has to
 know the interface layout *before* it initialises the interfaces, and USB is not
@@ -122,6 +139,24 @@ There is no feedback path from the regulator back into the MCU, so everything
 reported is the setpoint, never a measurement. Details in
 [docs/multibus-external-supply.md](docs/multibus-external-supply.md).
 
+## The isoSPI role
+
+Two modules on one isoSPI link have to be one master and one slave. The role
+used to be baked into the firmware image, but go-modules gives every module of
+a hardware revision the same image, so two of them would both come up as
+masters. From firmware 0.3.0 the controller decides: `isospi_role` in the
+configuration, pushed over the module bus on every bring-up, like the
+interfaces.
+
+**The module does not remember it.** After a reset it is back in the role its
+image starts in until the controller says otherwise, which is why the
+configuration file is what carries the role. Changing it needs no reset, so
+`go-multibus role slave` and the UI's role row store *and* apply it in one step.
+
+A configuration with one module that never set `isospi_role` pushes nothing and
+leaves the module in its image's role, exactly as before 0.3.0. In a module list
+the default is `master`.
+
 ## Device names
 
 Names are pinned by `debian/udev/81-gocontroll-multibus.rules`, because kernel
@@ -133,9 +168,42 @@ same module lands on `can2`..`can4`. The numbering follows the knowledge base
 The tooling falls back to sysfs discovery when the rule is not installed, but
 anything else on the controller that refers to a name needs it.
 
+### More than one module
+
+Two modules would both claim `mb_can1`, so with more than one module configured
+every name carries the slot instead:
+
+| Slot 7              | Slot 8              |
+|---------------------|---------------------|
+| `mb7_can1..3`       | `mb8_can1..3`       |
+| `/dev/mb7_serial1..3` | `/dev/mb8_serial1..3` |
+| `/dev/mb7_protocol` | `/dev/mb8_protocol` |
+
+Nothing in a uevent says which slot a USB device sits in - both modules have
+the same ids and the same interfaces. What tells them apart is the USB serial
+number, and the module bus, which does reach one particular slot, is where the
+service asks for it (firmware 0.3.0). It writes the answer down, one line per
+module:
+
+```
+206435A63245 mb7_
+2064359B3245 mb8_
+```
+
+in `/run/gocontroll/multibus-usb-names`, with a copy in
+`/var/lib/go-multibus/usb-names` that survives a reboot. The udev helper looks
+every device's serial number up there and puts the prefix in front of the name.
+A device udev reached before the line was written is named again by the service
+once it is, while its CAN interfaces are still down.
+
+One module - a plain configuration, or a module list with one entry - has no map
+and keeps the `mb_` names, so nothing about a single-module controller changes.
+
 ## Config file
 
 `/etc/gocontroll/multibus.json`. A missing file is a working configuration.
+
+One module, the form every release has read:
 
 ```json
 {
@@ -152,6 +220,24 @@ anything else on the controller that refers to a name needs it.
 }
 ```
 
+More than one module, as a list. Every entry takes the same keys as the
+one-module form plus `isospi_role`, and only `slot` is required; the rest
+default as above. `publish_interval_s` stays at the top.
+
+```json
+{
+  "publish_interval_s": 0.5,
+  "modules": [
+    { "slot": 7, "isospi_role": "slave", "interfaces": ["can", "rs485", "can", "rs485", "isospi"] },
+    { "slot": 8, "isospi_role": "master", "supply_enabled": true, "supply_mv": 9000 }
+  ]
+}
+```
+
+Slots must be 1..8 and different. `go-multibus module add 7` turns a one-module
+file into a list and `module remove` takes an entry out again; a list with one
+entry behaves exactly like the one-module form.
+
 `interfaces` is indexed by **connector interface**, so `interfaces[2]` is
 interface 3 and drives `mb_can2`.
 
@@ -162,6 +248,11 @@ interface 3 and drives `mb_can2`.
 temporary file and moved into place with `rename(2)`, which is atomic on Linux:
 a reader sees either the previous document or the new one, never half of either,
 and needs no locking.
+
+With more than one module each gets its own pair,
+`multibus-slot7-cells.json` and `multibus-slot7-state.json`, unless its entry
+sets `output`. The state document then also carries `isospi_role` (configured
+and reported) and `usb_serial`.
 
 Branch on `valid` - it is `link_ok && !stale`. Failures are published too, rather
 than leaving the last good document in place, so a reader can tell a dead service
@@ -228,7 +319,7 @@ package is built by running it into a staging prefix.
 
 ```sh
 cargo zigbuild --release --target aarch64-unknown-linux-musl
-BINDIR=target/aarch64-unknown-linux-musl/release debian/build-deb.sh 0.2.0 dist
+BINDIR=target/aarch64-unknown-linux-musl/release debian/build-deb.sh 0.3.0 dist
 ```
 
 The same script the release workflow runs, so what CI publishes is what you can
@@ -242,8 +333,8 @@ cargo test
 ```
 
 Everything covered is pure logic - the frame codec, the module bus message
-format, the configuration file, the supply picker - so the suite runs on any
-machine and needs neither a controller nor a module.
+format, the configuration file in both forms, the name map, the supply picker -
+so the suite runs on any machine and needs neither a controller nor a module.
 
 ## USB host mode
 
@@ -268,6 +359,13 @@ tooling says so rather than reporting a vague timeout.
 The external supply needs **0.2.0 or later**. On an older image everything else
 works and the supply row reads `not supported by this firmware`, which is
 reported once rather than on every bring-up.
+
+**Two modules on one controller, the runtime isoSPI role and `IDENTITY` need
+0.3.0 or later.** With more than one module configured an older image fails
+its bring-up with `firmware older than 0.3.0 cannot be told apart from another
+module; update it`, because without `IDENTITY` nothing ties its slot to its USB
+device. With one module an older image works as before; a configured role it
+cannot take is reported, not enforced.
 
 Firmware lives in the
 [Module-Multibus](https://github.com/GOcontroll/Module-Multibus) repository,

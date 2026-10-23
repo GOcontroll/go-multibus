@@ -15,13 +15,18 @@
 //! answer therefore goes out with the *next* transfer. [`request`] sends the
 //! same message repeatedly until the matching reply comes back, which is safe
 //! because every application message is idempotent.
+//!
+//! **An application that does not know a message still answers it**, with the
+//! identifier echoed and [`UNKNOWN_REPLY`] at byte 3. That is how a firmware
+//! older than 0.3.0 reacts to the role and identity messages, and [`Answer`]
+//! keeps it apart from no answer at all.
 
 use std::ffi::CString;
 use std::fs;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::proto::{Mode, Supply};
+use crate::proto::{Identity, Mode, Role, Supply};
 
 pub const MESSAGE_LENGTH: usize = 46;
 pub const BUFFER_LENGTH: usize = MESSAGE_LENGTH + 1;
@@ -36,6 +41,34 @@ pub mod msg {
     pub const STATUS: u8 = 102;
     pub const SUPPLY_GET: u8 = 103;
     pub const SUPPLY_SET: u8 = 104;
+    /// 0.3.0 and later: the isoSPI role in force at byte 3.
+    pub const ROLE_GET: u8 = 105;
+    /// 0.3.0 and later: role at byte 3 of the request; verdict at byte 3 of
+    /// the reply, the role now in force at byte 4.
+    pub const ROLE_SET: u8 = 106;
+    /// 0.3.0 and later: the 12 character USB serial number at bytes 3..14,
+    /// the 12 byte chip UID at bytes 15..26.
+    pub const IDENTITY: u8 = 107;
+}
+
+/// Byte 3 of the reply to a message the application does not know.
+pub const UNKNOWN_REPLY: u8 = 0xFF;
+
+/// How a request for one of the newer messages came back.
+///
+/// `Option` was enough while a message either existed or the module bus was
+/// silent altogether. From 0.3.0 there is a third case worth telling apart:
+/// a running application that answers but does not know the message, which
+/// means older firmware rather than a missing module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answer<T> {
+    /// The module understood the message; this is what it said.
+    Reply(T),
+    /// The module answered with the unknown-message reply: its firmware
+    /// predates the message.
+    Unsupported,
+    /// No valid reply at all.
+    Silent,
 }
 
 const SPI_IOC_WR_MODE: u64 = 0x4001_6B01;
@@ -272,10 +305,16 @@ impl ModuleBus {
         Ok(Some((accepted, active)))
     }
 
+    /// The external supply. `Ok(None)` also covers an application from before
+    /// 0.2.0, which answers with the unknown-message reply: byte 3 is the
+    /// enable flag here, so it is never 0xFF in a real answer.
     pub fn get_supply(&self) -> Result<Option<Supply>> {
         let Some(reply) = self.request(msg::SUPPLY_GET, &[])? else {
             return Ok(None);
         };
+        if reply[3] == UNKNOWN_REPLY {
+            return Ok(None);
+        }
         Ok(Some(Supply::from_bytes(&reply[3..3 + Supply::SIZE])?))
     }
 
@@ -286,10 +325,73 @@ impl ModuleBus {
         let Some(reply) = self.request(msg::SUPPLY_SET, &payload)? else {
             return Ok(None);
         };
+        // Before 0.2.0: not a refusal of the value but no supply at all, which
+        // the caller settles over USB where the answer says so properly.
+        if reply[3] == UNKNOWN_REPLY {
+            return Ok(None);
+        }
         let accepted = reply[3] == 0;
         let active = Supply::from_bytes(&reply[4..4 + Supply::SIZE])?;
         Ok(Some((accepted, active)))
     }
+
+    /// The isoSPI role the module runs in.
+    pub fn get_role(&self) -> Result<Answer<Role>> {
+        decode_role_get(self.request(msg::ROLE_GET, &[])?.as_deref())
+    }
+
+    /// Switch the isoSPI role; the reply carries whether it was accepted and
+    /// the role in force afterwards, which is the old one after a refusal.
+    pub fn set_role(&self, role: Role) -> Result<Answer<(bool, Role)>> {
+        decode_role_set(self.request(msg::ROLE_SET, &[role.as_byte()])?.as_deref())
+    }
+
+    /// The module's USB serial number and chip UID.
+    ///
+    /// This is the message that makes two modules on one controller work: it
+    /// is asked over the module bus, which reaches one particular slot, and it
+    /// answers with what the USB device of that slot will be called.
+    pub fn identity(&self) -> Result<Answer<Identity>> {
+        decode_identity(self.request(msg::IDENTITY, &[])?.as_deref())
+    }
+}
+
+/// Reply to `ROLE_GET`. Kept apart from the transfer so it can be tested.
+pub fn decode_role_get(reply: Option<&[u8]>) -> Result<Answer<Role>> {
+    let Some(reply) = reply else {
+        return Ok(Answer::Silent);
+    };
+    if reply[3] == UNKNOWN_REPLY {
+        return Ok(Answer::Unsupported);
+    }
+    Role::from_byte(reply[3])
+        .map(Answer::Reply)
+        .ok_or_else(|| Error::module(format!("the module reported unknown role {}", reply[3])))
+}
+
+/// Reply to `ROLE_SET`: verdict at byte 3, role in force at byte 4.
+pub fn decode_role_set(reply: Option<&[u8]>) -> Result<Answer<(bool, Role)>> {
+    let Some(reply) = reply else {
+        return Ok(Answer::Silent);
+    };
+    if reply[3] == UNKNOWN_REPLY {
+        return Ok(Answer::Unsupported);
+    }
+    let active = Role::from_byte(reply[4])
+        .ok_or_else(|| Error::module(format!("the module reported unknown role {}", reply[4])))?;
+    Ok(Answer::Reply((reply[3] == 0, active)))
+}
+
+/// Reply to `IDENTITY`. The serial starts at byte 3 and is ASCII, so it can
+/// never begin with the unknown-message marker.
+pub fn decode_identity(reply: Option<&[u8]>) -> Result<Answer<Identity>> {
+    let Some(reply) = reply else {
+        return Ok(Answer::Silent);
+    };
+    if reply[3] == UNKNOWN_REPLY {
+        return Ok(Answer::Unsupported);
+    }
+    Ok(Answer::Reply(Identity::from_bytes(&reply[3..3 + Identity::SIZE])?))
 }
 
 impl Drop for ModuleBus {
@@ -343,6 +445,72 @@ mod tests {
         let mut message = build_message(msg::STATUS, &[]);
         message[7] ^= 0xFF;
         assert!(!message_valid(&message, Some(msg::STATUS)));
+    }
+
+    /// A reply as the application lays it out: identifier, then data at byte 3.
+    fn reply(id: u8, data: &[u8]) -> Vec<u8> {
+        build_message(id, data)
+    }
+
+    #[test]
+    fn a_role_set_request_carries_the_role_at_byte_3() {
+        let message = build_message(msg::ROLE_SET, &[Role::Slave.as_byte()]);
+        assert!(message_valid(&message, Some(106)));
+        assert_eq!(message[3], 1);
+    }
+
+    #[test]
+    fn role_replies_decode() {
+        let get = reply(msg::ROLE_GET, &[1]);
+        assert_eq!(decode_role_get(Some(&get)).unwrap(), Answer::Reply(Role::Slave));
+
+        let accepted = reply(msg::ROLE_SET, &[0, 1]);
+        assert_eq!(
+            decode_role_set(Some(&accepted)).unwrap(),
+            Answer::Reply((true, Role::Slave))
+        );
+
+        // A refusal still says what the module runs as.
+        let refused = reply(msg::ROLE_SET, &[1, 0]);
+        assert_eq!(
+            decode_role_set(Some(&refused)).unwrap(),
+            Answer::Reply((false, Role::Master))
+        );
+
+        assert!(decode_role_get(Some(&reply(msg::ROLE_GET, &[7]))).is_err());
+    }
+
+    #[test]
+    fn an_older_application_is_told_apart_from_a_silent_one() {
+        // What firmware older than 0.3.0 sends back: the identifier echoed,
+        // 0xFF at byte 3.
+        let unknown = reply(msg::IDENTITY, &[UNKNOWN_REPLY]);
+        assert!(message_valid(&unknown, Some(msg::IDENTITY)));
+        assert_eq!(decode_identity(Some(&unknown)).unwrap(), Answer::Unsupported);
+        assert_eq!(
+            decode_role_get(Some(&reply(msg::ROLE_GET, &[UNKNOWN_REPLY]))).unwrap(),
+            Answer::Unsupported
+        );
+        assert_eq!(
+            decode_role_set(Some(&reply(msg::ROLE_SET, &[UNKNOWN_REPLY]))).unwrap(),
+            Answer::Unsupported
+        );
+
+        assert_eq!(decode_identity(None).unwrap(), Answer::Silent);
+        assert_eq!(decode_role_get(None).unwrap(), Answer::Silent);
+        assert_eq!(decode_role_set(None).unwrap(), Answer::Silent);
+    }
+
+    #[test]
+    fn an_identity_reply_decodes_serial_and_uid() {
+        let mut data = b"206435A63245".to_vec();
+        data.extend([0xAAu8; 12]);
+        let answer = decode_identity(Some(&reply(msg::IDENTITY, &data))).unwrap();
+        let Answer::Reply(identity) = answer else {
+            panic!("expected a reply, got {answer:?}");
+        };
+        assert_eq!(identity.serial, "206435A63245");
+        assert_eq!(identity.uid, [0xAA; 12]);
     }
 
     #[test]

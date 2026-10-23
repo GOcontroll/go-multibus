@@ -98,17 +98,19 @@ Request: empty. Answer: 14 bytes.
 | Offset | Size | Field                                             |
 |--------|------|---------------------------------------------------|
 | 0      | 1    | Protocol version, currently 1                      |
-| 1      | 1    | Role: 0 master, 1 slave/simulator                  |
+| 1      | 1    | isoSPI role in force: 0 master, 1 slave/simulator  |
 | 2-5    | 4    | Hardware id, `20-30-4-<variant>` as go-modules uses it |
-| 6-8    | 3    | Application version, major/minor/patch. 0.2.0 is the first with `SUPPLY_*` |
+| 6-8    | 3    | Application version, major/minor/patch. 0.2.0 is the first with `SUPPLY_*`, 0.3.0 the first with a runtime role, `IDENTITY`, `LINK_TEST` and CAN FD |
 | 9      | 1    | Number of connector interfaces (5)                 |
 | 10     | 1    | CDC port carrying this protocol (3)                |
 | 11     | 1    | Maximum cell count (24)                            |
 | 12     | 1    | Maximum temperature count (4)                      |
 | 13     | 1    | Maximum raw isoSPI transfer in bytes (64)          |
 
-Read the role before anything else: `SIM_SET` only exists on a simulator build
-and `ISOSPI_XFER` only on a master.
+Read the role before anything else: `SIM_SET` only works on a slave, and
+`ISOSPI_XFER` and `LINK_TEST` only on a master. Up to 0.2.0 the role was fixed
+per build configuration; since 0.3.0 it is chosen at runtime with `ROLE_SET`,
+and the build only decides the role a module starts in.
 
 ### 0x02 IF_GET / 0x03 IF_SET
 
@@ -127,6 +129,40 @@ Both answer with the five modes that are **active after the call**. A rejected
 combination comes back as status `bad parameter` together with the unchanged
 configuration, so a caller can always tell what the module is actually doing
 rather than what it was asked to do.
+
+Interface 5 set to `off` powers the LTC6820 down. To the module on the other end
+that looks exactly like a cut isoSPI cable, which makes it the way to stage a
+link fault on purpose.
+
+### 0x04 ROLE_GET / 0x05 ROLE_SET
+
+The isoSPI role. `ROLE_GET` takes no payload, `ROLE_SET` takes one byte: 0 for
+master, 1 for slave. Both answer with one byte, the role **in force after the
+call**; an unknown role comes back as `bad parameter` with the role unchanged.
+
+Changing the role shuts the LTC6820 down, rebuilds SPI2 and the chip select
+pin for the other direction and brings it back up; the link counters and the
+cell snapshot start over. Asking for the role already in force does nothing,
+so pushing it on every bring-up does not drop a working link.
+
+The role is not stored in the module. Like the interface configuration it is
+pushed by the controller on every bring-up, so after a reset a module comes
+back in its build default (master on a `V20300402` build) until it is told
+otherwise. Two modules of the same hardware revision get the same image from
+go-modules, which is why the role cannot be a build option any more.
+
+### 0x06 IDENTITY
+
+Request: empty. Answer: 24 bytes.
+
+| Offset | Size | Field                                                   |
+|--------|------|---------------------------------------------------------|
+| 0-11   | 12   | USB serial number, ASCII, exactly what the device descriptor reports |
+| 12-23  | 12   | Chip unique id (UID), raw                               |
+
+The module bus serves the same thing (message 107). That is how the controller
+ties a USB device to a slot when there is more than one module: it asks the
+slot over SPI who it is, then looks for the USB device with that serial number.
 
 ### 0x10 LINK_STATUS
 
@@ -198,6 +234,27 @@ This bypasses the frame protocol entirely and is how a real LTC681x battery
 monitor gets driven: build the command word and PEC in Python, send it, read the
 answer. It only works on a master build; a slave answers `not supported`.
 
+### 0x31 LINK_TEST
+
+Request: 1 to 80 bytes. Answer: a result byte, the round trip in microseconds
+as a `uint32`, then the bytes that came back.
+
+| Result | Meaning                                                    |
+|--------|------------------------------------------------------------|
+| 0      | ok: the slave echoed exactly what was sent                 |
+| 1      | no answer to this request came back within five polls      |
+| 2      | something came back but did not validate (CRC)             |
+| 3      | a valid answer, with different contents                    |
+
+The master sends the bytes to the slave as an `ECHO` request over isoSPI, waits
+12 ms for the slave to arm its answer, and clocks a cell poll to collect it -
+up to five times. The slave serves from its 10 ms tick, so the round trip is
+typically 13 to 15 ms. Master only; a slave answers `not supported`, and a
+master with interface 5 off answers `link down`.
+
+This is what an end-to-end link test is built on: varying lengths and
+incrementing contents, counted on the Linux side.
+
 ### 0x40 SIM_SET
 
 Request: 3 bytes - cell index (0 based), then voltage in 100 uV steps as
@@ -240,6 +297,42 @@ it, is in [multibus-external-supply.md](multibus-external-supply.md).
 
 Firmware older than 0.2.0 answers `unknown command` to both.
 
+### 0x60 ECHO
+
+Answers with the payload it was sent, up to 199 bytes. Served on both
+transports: over isoSPI it is what `LINK_TEST` bounces off the slave, over USB
+it checks the protocol port itself.
+
+### 0x70 CAN_STATS
+
+Request: empty. Answer: 32 bytes for each of the three gs_usb channels, in
+channel order (`mb_can1`, `mb_can2`, `mb_can3`).
+
+| Offset | Size | Field                                                       |
+|--------|------|-------------------------------------------------------------|
+| 0      | 4    | Frames received on the bus and queued for the host          |
+| 4      | 4    | Frames transmitted on the bus and echoed to the host        |
+| 8      | 4    | FDCAN receive FIFO overflows                                |
+| 12     | 4    | Received frames dropped because the host queue was full     |
+| 16     | 4    | Frames from the host dropped: queue full or channel not running |
+| 20     | 4    | Times the channel went bus-off                              |
+| 24     | 4    | Automatic restarts after bus-off                            |
+| 28     | 1    | State: 0 error active, 1 warning, 2 passive, 3 bus-off, 4 stopped |
+| 29     | 1    | Transmit error counter (TEC)                                |
+| 30     | 1    | Receive error counter (REC)                                 |
+| 31     | 1    | 1 when the channel runs                                     |
+
+The counters live outside the USB class state, so they survive a
+re-enumeration and say what happened before it.
+
+### 0x71 SERIAL_STATS
+
+Request: empty. Answer: 20 bytes for each of the three serial bridges, in port
+order (connector interfaces 2, 3, 4): bytes received on the connector, bytes
+sent on the connector, bytes dropped because the host did not keep up, receive
+errors (overrun, framing, noise, parity), and of those the overruns - each a
+`uint32`.
+
 ## Transport behaviour
 
 **Framing.** The port is a byte stream, so a frame can be split across USB
@@ -269,11 +362,21 @@ controller needs during bring-up is served there:
 | 102 | `STATUS`     | Role, link state, cell count, frame counters       |
 | 103 | `SUPPLY_GET` | The ten byte supply block at byte 3                |
 | 104 | `SUPPLY_SET` | Verdict at byte 3, the supply block at byte 4      |
+| 105 | `ROLE_GET`   | isoSPI role at byte 3 (0.3.0)                      |
+| 106 | `ROLE_SET`   | Request: role at byte 3. Verdict at byte 3, role in force at byte 4 (0.3.0) |
+| 107 | `IDENTITY`   | USB serial number (12 ASCII) at bytes 3-14, chip UID at 15-26 (0.3.0) |
 
 They start at 100 so they can never collide with a bootloader message. Because
 SPI is full duplex the answer to a request arrives during the *next* transfer,
 so the controller repeats the same message until the matching reply comes back;
 that is safe because every one of them is idempotent.
+
+The module resets SPI1 before arming every transfer. The G4 SPI has a four byte
+FIFO in each direction, and a transfer that arrived while the module was not
+armed used to leave bytes behind in them: every reply after that carried four
+stale bytes in front, every request came in shifted and failed its checksum,
+and the module bus stayed deaf until the module was reset. Only a peripheral
+reset empties those FIFOs.
 
 ## The isoSPI side
 

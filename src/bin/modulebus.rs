@@ -14,12 +14,17 @@
 //!               application — the route that lets the controller configure the
 //!               module before USB comes up.
 //!   supply      the same for the external supply on the connector.
+//!   role        read, or switch, the isoSPI role (0.3.0 and later). Not
+//!               stored by the module: the next reset undoes it, and
+//!               go-multibus pushes its configured role on every bring-up.
+//!   identity    the USB serial number and chip UID (0.3.0 and later) - what
+//!               ties this slot to one of several USB devices.
 
 use clap::{Parser, Subcommand};
 
 use go_multibus::error::{Error, Result};
-use go_multibus::modulebus::{self, ModuleBus, MESSAGE_LENGTH};
-use go_multibus::proto::{format_volts, Mode, INTERFACES};
+use go_multibus::modulebus::{self, Answer, ModuleBus, MESSAGE_LENGTH};
+use go_multibus::proto::{format_volts, Mode, Role, INTERFACES};
 
 #[derive(Parser)]
 #[command(
@@ -51,6 +56,13 @@ enum Command {
         /// `off`, or a voltage such as `9` or `9V`.
         setting: Option<String>,
     },
+    /// Read, or switch, the isoSPI role.
+    Role {
+        /// `master` or `slave`.
+        role: Option<String>,
+    },
+    /// The module's USB serial number and chip UID.
+    Identity,
 }
 
 fn main() {
@@ -72,7 +84,59 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Start => start(&bus),
         Command::Interfaces { modes } => interfaces(&bus, modes.as_deref()),
         Command::Supply { setting } => supply(&bus, setting.as_deref()),
+        Command::Role { role: wanted } => role(&bus, wanted.as_deref()),
+        Command::Identity => identity(&bus),
     }
+}
+
+/// What to say when the application answers with the unknown-message reply,
+/// or not at all.
+fn not_answered<T>(bus: &ModuleBus, answer: &Answer<T>) -> i32 {
+    match answer {
+        Answer::Unsupported => println!(
+            "slot {}: the application does not know this message; it runs firmware \
+             older than 0.3.0",
+            bus.slot()
+        ),
+        _ => println!("slot {}: no answer. Is the application running?", bus.slot()),
+    }
+    1
+}
+
+fn role(bus: &ModuleBus, wanted: Option<&str>) -> Result<i32> {
+    let Some(text) = wanted else {
+        return Ok(match bus.get_role()? {
+            Answer::Reply(active) => {
+                println!("role     : {active}");
+                0
+            }
+            other => not_answered(bus, &other),
+        });
+    };
+
+    let wanted = Role::parse(text)?;
+    Ok(match bus.set_role(wanted)? {
+        Answer::Reply((true, active)) => {
+            println!("role     : {active}");
+            0
+        }
+        Answer::Reply((false, active)) => {
+            println!("the module refused {wanted}; it runs as {active}");
+            1
+        }
+        other => not_answered(bus, &other),
+    })
+}
+
+fn identity(bus: &ModuleBus) -> Result<i32> {
+    Ok(match bus.identity()? {
+        Answer::Reply(identity) => {
+            println!("serial   : {}", identity.serial);
+            println!("chip uid : {}", identity.uid_hex());
+            0
+        }
+        other => not_answered(bus, &other),
+    })
 }
 
 fn probe(bus: &ModuleBus) -> Result<i32> {
@@ -280,4 +344,15 @@ fn hex(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
 }

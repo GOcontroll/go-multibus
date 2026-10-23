@@ -3,7 +3,8 @@
 `go-multibus` brings a Multibus module up after a controller boot, configures
 its interfaces, and keeps the battery cell data flowing to the rest of the
 system. It is the piece that makes the module work without anyone typing
-anything.
+anything - and with more than one module in the controller, it does that for
+each of them.
 
 > The file names in this document - `MbInterfaces.c`, `MbSupply.c`,
 > `MbProto.c`, `usbd_composite.c` - are firmware sources and live in the
@@ -37,6 +38,9 @@ A freshly powered module does not do anything useful on its own:
 - The external supply on the connector has to be what the machine expects. The
   module remembers that one by itself, but the controller still owns the value -
   see [multibus-external-supply.md](multibus-external-supply.md).
+- Two modules on one isoSPI link have to be one master and one slave, and the
+  module does not remember which it is. Every module of a hardware revision
+  gets the same image, so the role cannot come from the build either.
 
 The order matters, and it is the reason the configuration goes over SPI:
 
@@ -55,14 +59,18 @@ The order matters, and it is the reason the configuration goes over SPI:
 |-------------|---------------------------------------------------------------------|
 | `reset`     | Pulse the slot reset line. The STM32 restarts into the bootloader.   |
 | `start`     | Identify the module, then send the bootloader `UP_TO_DATE` so it jumps to the application. |
-| `configure` | Send `IF_SET` over the module bus with the five interface modes, then `SUPPLY_SET` with the external supply. |
-| `enumerate` | Wait for the USB device and its four CDC ports, then open the protocol port and apply the cell configuration. |
+| `configure` | Send `IF_SET` over the module bus with the five interface modes, then `ROLE_SET` with the isoSPI role, `SUPPLY_SET` with the external supply, and - with more than one module configured - `IDENTITY` for the USB serial number. |
+| `enumerate` | Wait for the USB device and its four CDC ports, then open the protocol port and apply the cell configuration. With several modules: wait for *this* module's USB device, found by its serial number, check its names, and confirm over USB that it is the right one. |
 | `running`   | Poll the cell snapshot and publish it.                               |
 
 Every step is idempotent, and the sequence is re-entered from the top whenever
 the module disappears. That is what makes recovery automatic: pull the module
 and put it back, and the service resets, restarts, reconfigures and resumes
 without anyone intervening.
+
+With more than one module configured each runs this sequence in its own thread,
+and every line in the journal starts with `slot N: `. A module that is being
+reset never holds up another one's data.
 
 A failure inside `running` gets a three second grace period before the module is
 reset, because a single dropped USB poll is not a reason to restart a working
@@ -73,10 +81,14 @@ module. A failure during bring-up restarts the sequence immediately.
 Two links to the same module, each doing what it is good at:
 
 **The module bus (SPI)** exists before USB and stays available regardless of
-whether USB enumerated. It carries the interface configuration, the external
-supply and a compact status message. `ModuleBus.c` serves it in the
-application, using the same 46 byte message format as the bootloader so
-`gocontroll-modulebus` needs no second code path.
+whether USB enumerated. It carries the interface configuration, the isoSPI
+role, the external supply, the module's identity and a compact status message.
+`ModuleBus.c` serves it in the application, using the same 46 byte message
+format as the bootloader so `gocontroll-modulebus` needs no second code path.
+
+It is also the one link that is tied to a slot - each slot has its own chip
+select - which is what makes it the place to ask a module for its USB serial
+number when there are several. USB reaches devices, not slots.
 
 Because SPI is full duplex, the module cannot answer in the transfer that
 carries the request - it only learns what was asked once the last byte is
@@ -132,7 +144,7 @@ bottom. Navigation is the same too - move with the arrows, Enter to descend into
 a picker, Left or Esc to come back, q or Esc to leave.
 
 ```
-  GOcontroll Moduline Multibus tool  v0.2.0
+  GOcontroll Moduline Multibus tool  v0.3.0
   ------------------------------------
   Module: slot 8   running
   ------------------------------------
@@ -141,10 +153,22 @@ a picker, Left or Esc to come back, q or Esc to leave.
   > Interface 3   18/19    CAN FD
     Interface 4   24/25    RS485
     Interface 5   isoSPI   isoSPI
+    isoSPI role            master
     Supply        5-15 V   9 V         kept over a reset
   ------------------------------------
   up/down navigate   Enter select   c cells   r restart   q quit
 ```
+
+With more than one module configured the header says which one the list is
+about, and Tab moves on to the next:
+
+```
+  Module: slot 7   running   Tab next module
+```
+
+Every module has its own list, its own log lines underneath, and its own cell
+view; all of them are looked after while the UI is open, not just the one on
+screen.
 
 Enter on an interface opens its mode picker, listing only what that interface
 can actually be:
@@ -167,9 +191,28 @@ module bus, which is only read before USB comes up. The hint line says so.
 Interface 1 is fixed, so its picker has a single entry and a note saying it is
 not configurable.
 
-The last row is the **external supply**, and it is the one thing in the list
-that applies without a reset - the module takes the setpoint immediately and
-writes it to its own flash:
+The **isoSPI role** row picks which end of the battery link the module drives.
+It applies without a reset: the module switches on the spot, and the role is
+stored in the configuration, because the module itself forgets it at the next
+reset and the service pushes it again on every bring-up.
+
+```
+  isoSPI role  -  Select Role
+
+  > master
+    slave
+  ------------------------------------
+  up/down navigate   Enter apply   left/Esc back
+```
+
+A one-module configuration that never set a role shows `default` and leaves
+the module in whatever role its image starts in, with `module runs as master`
+beside it. A module running in a different role than the one configured says
+`module has slave` in red - and adds `fixed by its firmware` when it runs an
+image older than 0.3.0, which cannot switch.
+
+The last row is the **external supply**, which also applies without a reset -
+the module takes the setpoint immediately and writes it to its own flash:
 
 ```
   External supply  -  Select Voltage
@@ -222,6 +265,7 @@ cells      : 12, pack 43.464 V, spread 0.0440 V (simulated)
 $ go-multibus config
 $ go-multibus set 3 can
 $ go-multibus supply 9V
+$ go-multibus role slave
 $ go-multibus ports
 ```
 
@@ -229,12 +273,75 @@ $ go-multibus ports
 does not touch a running module, so a scripted change and a running machine
 never disagree about what is happening.
 
-`supply` is the exception, and for the same reason the UI's supply picker is:
-changing the voltage needs no reset, so it is stored *and* applied straight
+`supply` and `role` are the exceptions, and for the same reason the UI's
+pickers are: neither needs a reset, so each is stored *and* applied straight
 away when the module is reachable. When it is not, the value is still stored
-and the next bring-up pushes it.
+and the next bring-up pushes it. `role` without an argument shows the
+configured role next to the one the module reports.
 
 `status --json` prints the two published documents instead of the summary.
+
+With more than one module, `status` shows each of them in turn - with its role
+and USB serial number - and `status --slot 7` only that one; `--json` then
+prints a `modules` list. `set`, `supply` and `role` need `--slot` to say which
+module they are about:
+
+```console
+$ go-multibus set --slot 7 3 can
+$ go-multibus role --slot 7 slave
+$ go-multibus supply --slot 8 off
+```
+
+`ports` lists every module present: its USB serial number, the slot the name
+map puts it in, its serial ports and protocol port under their udev names, and
+its CAN interfaces.
+
+`module add` and `module remove` edit the list of modules:
+
+```console
+$ go-multibus module add 7
+slot 7 added to /etc/gocontroll/multibus.json; configured slots: 7, 8
+the file now holds a module list
+slot 8 had no isospi_role and is now master, the default in a module list; ...
+slot 7 is now named mb7_can1..3, /dev/mb7_serial1..3 and /dev/mb7_protocol, ...
+slot 8 is now named mb8_can1..3, /dev/mb8_serial1..3 and /dev/mb8_protocol, ...
+restart the service for it to take effect: systemctl restart go-multibus
+```
+
+Adding a second module turns a one-module file into a module list and says
+what changes for the module that was already there - its names and its
+published file now carry its slot. Removing down to one module keeps the list
+with one entry, and that module goes back to the plain `mb_` names.
+
+### The lower-level tools
+
+`gocontroll-cellmon` talks to one module's protocol port. With several present,
+`--slot 7` picks the module the name map puts in slot 7 and `--serial` the one
+with that USB serial number; `list` shows both for every module.
+
+```console
+$ gocontroll-cellmon list
+$ gocontroll-cellmon --slot 7 identity        # USB serial number and chip UID
+$ gocontroll-cellmon --slot 7 role slave      # until the next reset
+$ gocontroll-cellmon --slot 8 link-test --count 1000 --min 1 --max 80
+```
+
+`link-test` bounces counting byte patterns off the slave through the master's
+`LINK_TEST`, cycling the length from `--min` to `--max`, and prints how many
+came back ok, with no answer, with a CRC error or changed, plus the minimum,
+mean and maximum round trip as the master timed it. Run it on the master; a
+slave answers that it cannot.
+
+`gocontroll-modulebus` has `role` and `identity` too, over SPI, which work
+before USB is up and say which slot a serial number belongs to:
+
+```console
+$ gocontroll-modulebus 7 identity
+$ gocontroll-modulebus 7 role master
+```
+
+A role set with either tool lasts until the module is next reset. Only the
+configuration survives that, which is what `go-multibus role` writes.
 
 ## Before any of this works: the OTG port
 
@@ -306,11 +413,54 @@ missing file is itself a working configuration.
 | `output` | Where the cell data is published. |
 | `supply_enabled` | Whether the module's regulator is on. |
 | `supply_mv` | Its setpoint in mV, a whole number of volts from 5000 to 15000. |
+| `isospi_role` | `master` or `slave`, pushed on every bring-up. Left out of a one-module file, the module keeps the role its image starts in. |
 
 `module_poll_ms` and `publish_interval_s` are independent. The module keeps its
 own most recent snapshot, so a publish never waits for a battery round trip - it
 always gets an answer immediately, with an `age_ms` field saying how old that
 answer is.
+
+### More than one module
+
+A controller with several modules lists them under `modules`. Every entry takes
+the keys of the table above except `publish_interval_s`, which stays at the top
+because there is one publish rhythm per service; only `slot` is required, and
+`isospi_role` defaults to `master`.
+
+```json
+{
+  "publish_interval_s": 0.5,
+  "modules": [
+    {
+      "slot": 7,
+      "isospi_role": "slave",
+      "interfaces": ["can", "rs485", "can", "rs485", "isospi"],
+      "cell_count": 12,
+      "supply_enabled": false
+    },
+    {
+      "slot": 8,
+      "isospi_role": "master",
+      "supply_enabled": true,
+      "supply_mv": 9000
+    }
+  ]
+}
+```
+
+Slots are 1..8 and each may appear once; a file with a slot twice is refused
+rather than half used. `output` may be set per module, and two modules may not
+share one.
+
+What decides the behaviour is the number of modules, not the form of the file:
+a list with one entry is named and published exactly like the one-module form,
+`mb_can1` and `multibus-cells.json` included. That is what `module remove`
+leaves behind, and it means going from two modules back to one never needs the
+file rewritten by hand.
+
+A file is written back in the form it was read in. A one-module file that has
+had an interface changed comes back exactly as an older release would have
+written it - `isospi_role` only appears once a role has been set.
 
 ### Device names
 
@@ -357,9 +507,66 @@ udevadm control --reload-rules && udevadm trigger --action=add
 
 Without the rule the tooling still works - it falls back to discovering the
 interfaces through sysfs - but anything else on the controller that refers to a
-name has to do the same. With more than one Multibus module present the names
-collide and only the first module gets them; that case needs a rule keyed on
-the serial number.
+name has to do the same.
+
+### Device names with more than one module
+
+Two modules would both claim `mb_can1`, and udev would leave the second on its
+kernel name. So once more than one module is configured, every name carries
+the slot:
+
+| Slot 7              | Slot 8              | Knowledge base    |
+|---------------------|---------------------|-------------------|
+| `mb7_can1..3`       | `mb8_can1..3`       | CAN 1..3          |
+| `/dev/mb7_serial1..3` | `/dev/mb8_serial1..3` | RS485 1..3 / RS232 1 |
+| `/dev/mb7_protocol` | `/dev/mb8_protocol` | -                 |
+
+The longest, `mb8_can3`, fits easily in the 15 characters a network interface
+name may have.
+
+The difficulty is that nothing in a uevent says which slot a device is in: both
+modules have the same vendor and product id and the same interfaces. The USB
+serial number tells them apart but says nothing about slots. The module bus
+closes the gap - it reaches one slot, and from 0.3.0 the module answers
+`IDENTITY` on it with the very serial number its USB descriptor carries. The
+service asks during `configure` and writes down what it learned, one module per
+line:
+
+```
+206435A63245 mb7_
+2064359B3245 mb8_
+```
+
+`/run/gocontroll/multibus-usb-names` is the live copy, rewritten as modules come
+up. `/var/lib/go-multibus/usb-names` survives a reboot, so a module that
+enumerates before the service has run is still named right. The udev helper
+looks each device's serial number up, live copy first, and puts the prefix in
+front of the name; `gocontroll-multibus-canname --prefix <serial>` prints just
+the prefix, which is what the tty rules use.
+
+USB enumerates at about the same moment the service learns the serial number,
+so the two race:
+
+- A map that does not list the serial yet makes the helper wait up to three
+  seconds for the line to appear. The service creates the live map before it
+  resets the first module, which is what makes that wait happen even on the
+  very first boot.
+- Whatever udev still named first - with the `mb_` names, or its kernel name -
+  is put right by the service: after enumeration it looks at *its* module's
+  devices only (found by serial number, not by name), and if any is wrong has
+  udev process exactly those again with `udevadm trigger --action=add`. The CAN
+  interfaces are still down at that point, so the rename succeeds. Another
+  module's devices are never touched.
+
+With one module configured there is no map: the service removes one left over
+from a configuration with more, and the helper then gives every Multibus device
+the `mb_` names, exactly as before. A module running firmware older than 0.3.0
+has no `IDENTITY` and cannot be told apart from another one, so with more than
+one module configured its bring-up fails with
+`firmware older than 0.3.0 cannot be told apart from another module; update it`.
+
+`gocontroll-cellmon --slot 7` finds a module through the same map, and
+`--serial` takes the serial number directly.
 
 ### Which CAN interfaces come up
 
@@ -368,6 +575,11 @@ because the USB descriptor is fixed. The service only brings up the ones with a
 live transceiver: `mb_can1` is always CAN, `mb_can2` and `mb_can3` follow
 connector interfaces 3 and 4. A channel whose interface is RS485 is left down,
 since a netdev that can never carry a frame is worse than no netdev at all.
+
+With several modules each service thread only looks at its own module's
+netdevs, found under its USB device, and raises them by their slot names
+(`mb7_can1`). One that udev has not renamed is left alone rather than raised
+under the wrong name, because an interface that is up can no longer be renamed.
 
 ## Bitrates: go-can, not go-multibus
 
@@ -397,7 +609,8 @@ RS485 will succeed and do nothing useful, because the transceiver is in standby.
 ### What had to change in go-can
 
 `list_can_devices()` matched `canN` only, so the renamed module interfaces were
-invisible to both `go-can list` and its TUI. It now matches `mb_canN` as well.
+invisible to both `go-can list` and its TUI. It now matches `mb_canN` as well,
+and `mb<slot>_canN` - `mb7_can1` - for a controller with more than one module.
 
 More subtly, the module's buses needed their own defaults. gs_usb supports fewer
 netlink options than the baseboard's mcp251x controllers, and two of the
@@ -412,9 +625,26 @@ Without that change the very first `go-can set mb_can1 bitrate 500000` saved the
 config and then failed to apply it. `defaults::default_for_module()` turns both
 off, and `config::load_or_default()` seeds new configs from it.
 
-**Bus-off recovery is therefore the application's problem on these interfaces.**
-The driver will not restart the controller by itself the way the baseboard ones
-do.
+The driver cannot restart a controller after bus-off, so since firmware 0.3.0
+**the module does it itself**, 100 ms after the bus-off - the same recovery the
+baseboard buses get from `restart-ms 100`. The kernel still sees the bus-off and
+the restart as error frames, so `ip -details -statistics link show` counts both.
+
+### CAN FD
+
+All three module buses are CAN FD capable, and from firmware 0.3.0 on the kernel
+knows it, so the usual go-can keys apply:
+
+```console
+# go-can set mb_can1 bitrate 500000
+# go-can set mb_can1 data-bitrate 2000000
+# go-can set mb_can1 fd on
+```
+
+Set the data bitrate before switching FD on: `fd on` without one is refused by
+the kernel. On firmware older than 0.3.0 `fd on` fails with `Operation not
+supported`. `ip -details link show` reports the error counters as
+`berr-counter tx N rx N`, read live from the module.
 
 ## What it publishes
 
@@ -443,6 +673,22 @@ stands:
 
 `supply` is `null` on a module whose firmware predates 0.2.0.
 
+With more than one module configured each publishes its own pair,
+`multibus-slot7-cells.json` and `multibus-slot7-state.json` (unless its entry
+sets `output`), and the state document gains two fields:
+
+```json
+{
+  "slot": 7,
+  "isospi_role": { "configured": "slave", "reported": "slave" },
+  "usb_serial": "206435A63245",
+  ...
+}
+```
+
+`reported` is what the module says it runs as, `null` until it has been asked.
+With one module the documents keep their names and their shape.
+
 Both are written to a temporary file and moved into place with `rename(2)`,
 which is atomic on Linux. A reader either sees the previous document or the new
 one in full, never half of either, so it needs no locking and no cooperation
@@ -462,6 +708,9 @@ a dead battery link; this way it can.
 | `running`, `failures` climbing | USB works but polls fail. `journalctl -u go-multibus` has the error text. |
 | `running` but `valid` false | USB is fine and the isoSPI link is not. Use `gocontroll-cellmon status` on the counters. |
 | supply row says `not supported by this firmware` | The module runs a build older than 0.2.0. Everything else works; flash a current image to get the supply. |
+| `firmware older than 0.3.0 cannot be told apart from another module` | More than one module is configured and this one has no `IDENTITY`. Flash 0.3.0 or newer. |
+| role row says `module has ...` | The module runs in another isoSPI role than configured. `fixed by its firmware` means an image older than 0.3.0, which cannot switch. |
+| a module keeps `mb_` or kernel names next to another module | Check `/run/gocontroll/multibus-usb-names` lists its serial (`gocontroll-cellmon list` shows it) and that the udev rule is installed. The service logs which devices it could not rename. |
 
 ## Related documents
 

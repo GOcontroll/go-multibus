@@ -1,6 +1,6 @@
 [package]
 name = "go-multibus"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["GOcontroll B.V. <info@gocontroll.com>"]
 description = "GOcontroll Multibus module service, configuration UI and utilities"

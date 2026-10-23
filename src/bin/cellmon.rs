@@ -9,6 +9,10 @@
 //! it alive — this talks to one that is already running. That makes it the
 //! right tool for looking at a module without changing anything, and the wrong
 //! one for bringing a machine up.
+//!
+//! With more than one module present, say which one: `--slot` looks the slot up
+//! in the name map go-multibus writes, `--serial` takes the USB serial number
+//! that `list` shows, and `--device` names the port outright.
 
 use std::time::{Duration, Instant};
 
@@ -18,7 +22,8 @@ use go_multibus::config::OUTPUT_PATH;
 use go_multibus::discover;
 use go_multibus::error::{Error, Result};
 use go_multibus::link::MultibusLink;
-use go_multibus::proto::{format_volts, Mode, INTERFACES};
+use go_multibus::namemap;
+use go_multibus::proto::{format_volts, link_test, status, Mode, Role, INTERFACES};
 use go_multibus::shm;
 
 #[derive(Parser)]
@@ -32,16 +37,44 @@ struct Cli {
     #[arg(short, long, global = true)]
     device: Option<String>,
 
+    /// The module with this USB serial number, as `list` shows it.
+    #[arg(long, global = true, conflicts_with = "device")]
+    serial: Option<String>,
+
+    /// The module in this controller slot, looked up in the name map.
+    #[arg(long, global = true, conflicts_with_all = ["device", "serial"])]
+    slot: Option<u8>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show the Multibus ports on this controller.
+    /// Show the Multibus modules on this controller and their ports.
     List,
     /// Identity, role and capabilities.
     Info,
+    /// USB serial number and chip UID.
+    Identity,
+    /// Show the isoSPI role, or switch it until the next reset.
+    Role {
+        /// `master` or `slave`.
+        role: Option<String>,
+    },
+    /// Bounce test patterns off the slave and count how they came back.
+    LinkTest {
+        /// How many round trips.
+        #[arg(long, default_value_t = 100)]
+        count: u32,
+        /// Shortest payload in bytes, 1..80. Lengths cycle from min to max;
+        /// either defaults to the other, both to 16.
+        #[arg(long, value_name = "L")]
+        min: Option<usize>,
+        /// Longest payload in bytes, 1..80.
+        #[arg(long, value_name = "L")]
+        max: Option<usize>,
+    },
     /// isoSPI link counters.
     Status,
     /// Connector interface configuration.
@@ -114,15 +147,80 @@ fn main() {
     });
 }
 
+/// The protocol port the options point at, or `None` to find the only one.
+fn chosen_device(cli: &Cli) -> Result<Option<String>> {
+    if let Some(device) = &cli.device {
+        return Ok(Some(device.clone()));
+    }
+    if let Some(serial) = &cli.serial {
+        return discover::protocol_port_for_serial(serial).map(Some);
+    }
+    if let Some(slot) = cli.slot {
+        return discover::protocol_port_for_slot(slot).map(Some);
+    }
+    Ok(None)
+}
+
 fn run(cli: Cli) -> Result<()> {
     if matches!(cli.command, Command::List) {
         return list();
     }
 
-    let mut link = MultibusLink::open(cli.device.as_deref())?;
+    // Arguments are checked before anything is opened, so a typo is not
+    // reported as a missing module.
+    if let Command::LinkTest { count, min, max } = &cli.command {
+        link_test_lengths(*count, *min, *max)?;
+    }
+
+    let device = chosen_device(&cli)?;
+    let mut link = MultibusLink::open(device.as_deref())?;
 
     match cli.command {
         Command::List => unreachable!("handled above"),
+
+        Command::Identity => {
+            let identity = link.identity().map_err(older_than_0_3_0)?;
+            println!("device         : {}", link.device());
+            println!("usb serial     : {}", identity.serial);
+            println!("chip uid       : {}", identity.uid_hex());
+            match namemap::slot_for_serial(&identity.serial) {
+                Some(slot) => println!("slot           : {slot} (from the name map)"),
+                None => println!("slot           : not in the name map"),
+            }
+        }
+
+        Command::Role { role } => {
+            let active = match role {
+                None => match link.get_role() {
+                    Ok(role) => role,
+                    Err(failure) if failure.is_unknown_command() => {
+                        let info = link.info()?;
+                        println!(
+                            "role           : {} (fixed: firmware older than 0.3.0 cannot switch)",
+                            info.role_name()
+                        );
+                        return Ok(());
+                    }
+                    Err(failure) => return Err(failure),
+                },
+                Some(text) => {
+                    let wanted = Role::parse(&text)?;
+                    match link.set_role(wanted) {
+                        Ok(active) => active,
+                        Err(failure) if failure.is_status(status::BAD_PARAMETER) => {
+                            let active = link.get_role()?;
+                            return Err(Error::module(format!(
+                                "the module refused {wanted}; it runs as {active}"
+                            )));
+                        }
+                        Err(failure) => return Err(older_than_0_3_0(failure)),
+                    }
+                }
+            };
+            println!("role           : {active}");
+        }
+
+        Command::LinkTest { count, min, max } => link_test_run(&mut link, count, min, max)?,
 
         Command::Info => {
             let info = link.info()?;
@@ -261,25 +359,163 @@ fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Say what an unknown command means for the commands 0.3.0 brought.
+fn older_than_0_3_0(failure: Error) -> Error {
+    if failure.is_unknown_command() {
+        Error::module(format!("{failure}: the module runs firmware older than 0.3.0"))
+    } else {
+        failure
+    }
+}
+
 fn list() -> Result<()> {
-    let ports = discover::enumerate_ports();
-    if ports.is_empty() {
-        println!("no Multibus ports found");
+    let modules = discover::usb_modules();
+    if modules.is_empty() {
+        println!("no Multibus modules found");
         return Ok(());
     }
-    for port in ports {
-        let role = if port.is_protocol_port {
-            "module protocol".to_string()
+
+    for (index, module) in modules.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        let serial = if module.serial.is_empty() {
+            "(no serial number)"
         } else {
-            match port.connector_interface {
-                Some(number) => format!("connector interface {number}"),
-                None => "unknown".to_string(),
+            module.serial.as_str()
+        };
+        let slot = match namemap::slot_for_serial(&module.serial) {
+            Some(slot) => format!("slot {slot}"),
+            None => "slot not in the name map".to_string(),
+        };
+        println!("serial {serial}   {slot}   usb {}", module.usb_path);
+
+        for port in discover::module_ports(module) {
+            let role = if port.is_protocol_port {
+                "module protocol".to_string()
+            } else {
+                match port.connector_interface {
+                    Some(number) => format!("connector interface {number}"),
+                    None => "unknown".to_string(),
+                }
+            };
+            let link = discover::port_link(&port).unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {link:<18} {:<14} usb interface {:<2}  {role}",
+                port.device, port.usb_interface
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The payload lengths a link test cycles through. Either bound defaults to
+/// the other, and both to 16 bytes.
+fn link_test_lengths(count: u32, min: Option<usize>, max: Option<usize>) -> Result<(usize, usize)> {
+    const DEFAULT_LENGTH: usize = 16;
+    let shortest = min.or(max).unwrap_or(DEFAULT_LENGTH);
+    let longest = max.or(min).unwrap_or(DEFAULT_LENGTH);
+    if shortest == 0 || longest > link_test::MAX_PAYLOAD || shortest > longest {
+        return Err(Error::user(format!(
+            "payload lengths must satisfy 1 <= min <= max <= {}",
+            link_test::MAX_PAYLOAD
+        )));
+    }
+    if count == 0 {
+        return Err(Error::user("count must be at least 1"));
+    }
+    Ok((shortest, longest))
+}
+
+/// Bounce `count` patterns off the slave and report how they came back.
+///
+/// The bytes count up from a different start every round, and the length
+/// cycles from `min` to `max`, so a stuck bit, a dropped byte and a length
+/// the link cannot carry each show up as something other than "ok".
+fn link_test_run(
+    link: &mut MultibusLink,
+    count: u32,
+    min: Option<usize>,
+    max: Option<usize>,
+) -> Result<()> {
+    let (shortest, longest) = link_test_lengths(count, min, max)?;
+
+    // ok, no answer, crc, mismatch, any other result code
+    let mut results = [0u32; 5];
+    let mut request_failures = 0u32;
+    let mut latencies: Vec<u32> = Vec::new();
+    let span = longest - shortest + 1;
+
+    for round in 0..count {
+        let length = shortest + round as usize % span;
+        let payload: Vec<u8> = (0..length)
+            .map(|index| (round as usize + index) as u8)
+            .collect();
+
+        let test = match link.link_test(&payload) {
+            Ok(test) => test,
+            // These do not get better by repeating them.
+            Err(failure) if failure.is_status(status::NOT_SUPPORTED) => {
+                return Err(Error::module(
+                    "this module is the isoSPI slave; run the link test on the master",
+                ))
+            }
+            Err(failure) if failure.is_status(status::LINK_DOWN) => {
+                return Err(Error::module(
+                    "the isoSPI transceiver is off; set interface 5 to isospi first",
+                ))
+            }
+            Err(failure) if failure.is_unknown_command() => return Err(older_than_0_3_0(failure)),
+            Err(_) => {
+                request_failures += 1;
+                continue;
             }
         };
+
+        // The master compares the echo itself; checking it here as well
+        // catches anything between the master and USB.
+        let code = if test.ok() && test.echoed != payload {
+            link_test::MISMATCH
+        } else {
+            test.result
+        };
+        results[usize::from(code.min(4))] += 1;
+        if code == link_test::OK {
+            latencies.push(test.micros);
+        }
+    }
+
+    println!("round trips    : {count}, {shortest}..{longest} bytes");
+    for code in [
+        link_test::OK,
+        link_test::NO_ANSWER,
+        link_test::CRC,
+        link_test::MISMATCH,
+    ] {
         println!(
-            "{:<16} usb interface {:<2}  {role}",
-            port.device, port.usb_interface
+            "{:<15}: {}",
+            link_test::result_name(code),
+            results[usize::from(code)]
         );
+    }
+    if results[4] > 0 {
+        println!("{:<15}: {}", "other result", results[4]);
+    }
+    if request_failures > 0 {
+        println!("{:<15}: {request_failures}", "no USB answer");
+    }
+
+    if let (Some(lowest), Some(highest)) = (latencies.iter().min(), latencies.iter().max()) {
+        let mean = latencies.iter().map(|&value| u64::from(value)).sum::<u64>()
+            / latencies.len() as u64;
+        println!("latency        : min {lowest} us, mean {mean} us, max {highest} us");
+    }
+
+    let failed = count - results[0];
+    if failed > 0 {
+        return Err(Error::module(format!(
+            "{failed} of {count} round trips failed"
+        )));
     }
     Ok(())
 }
@@ -431,5 +667,54 @@ fn serve(
         if spent < period {
             std::thread::sleep(period - spent);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{link_test_lengths, Cli, Command};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn link_test_lengths_default_to_each_other() {
+        assert_eq!(link_test_lengths(1, None, None).unwrap(), (16, 16));
+        assert_eq!(link_test_lengths(1, Some(4), None).unwrap(), (4, 4));
+        assert_eq!(link_test_lengths(1, None, Some(80)).unwrap(), (80, 80));
+        assert_eq!(link_test_lengths(1, Some(1), Some(80)).unwrap(), (1, 80));
+        assert!(link_test_lengths(1, Some(0), Some(8)).is_err());
+        assert!(link_test_lengths(1, Some(1), Some(81)).is_err());
+        assert!(link_test_lengths(1, Some(9), Some(8)).is_err());
+        assert!(link_test_lengths(0, None, None).is_err());
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_module_is_picked_by_slot_or_by_serial_but_not_both() {
+        let cli = Cli::parse_from(["gocontroll-cellmon", "--slot", "7", "identity"]);
+        assert_eq!(cli.slot, Some(7));
+        assert!(matches!(cli.command, Command::Identity));
+
+        let cli = Cli::parse_from(["gocontroll-cellmon", "role", "slave", "--serial", "206435A63245"]);
+        assert_eq!(cli.serial.as_deref(), Some("206435A63245"));
+
+        assert!(Cli::try_parse_from([
+            "gocontroll-cellmon", "--slot", "7", "--serial", "206435A63245", "info"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn a_link_test_takes_a_count_and_a_length_range() {
+        let cli = Cli::parse_from([
+            "gocontroll-cellmon", "link-test", "--count", "50", "--min", "1", "--max", "80",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Command::LinkTest { count: 50, min: Some(1), max: Some(80) }
+        ));
     }
 }

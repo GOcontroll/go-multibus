@@ -10,7 +10,10 @@ use std::ffi::CString;
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::proto::{self, cmd, CellSnapshot, Info, InterfaceConfig, LinkStatus, Mode, Supply};
+use crate::proto::{
+    self, cmd, CanChannelStats, CellSnapshot, Identity, Info, InterfaceConfig, LinkStatus,
+    LinkTest, Mode, Role, SerialPortStats, Supply,
+};
 
 /// How long a request waits for its answer before it is retried.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -349,6 +352,46 @@ impl MultibusLink {
         payload.extend_from_slice(&hundred_uv.to_le_bytes());
         self.request(cmd::SIM_SET, &payload)?;
         Ok(())
+    }
+
+    /// The isoSPI role in force. Firmware older than 0.3.0 answers `unknown
+    /// command`; the role byte of [`MultibusLink::info`] is the fallback there.
+    pub fn get_role(&mut self) -> Result<Role> {
+        Role::from_bytes(&self.request(cmd::ROLE_GET, &[])?)
+    }
+
+    /// Switch the isoSPI role. Takes effect immediately and is not stored: the
+    /// module starts in its build default after a reset, which is why the
+    /// service pushes the configured role on every bring-up.
+    ///
+    /// A role the module cannot take comes back as status `bad parameter`.
+    pub fn set_role(&mut self, role: Role) -> Result<Role> {
+        Role::from_bytes(&self.request(cmd::ROLE_SET, &[role.as_byte()])?)
+    }
+
+    /// USB serial number and chip UID, 0.3.0 and later.
+    pub fn identity(&mut self) -> Result<Identity> {
+        Identity::from_bytes(&self.request(cmd::IDENTITY, &[])?)
+    }
+
+    /// One isoSPI round trip off the slave, timed by the master. Master only:
+    /// a slave answers `not supported`, and a powered down transceiver (interface
+    /// 5 off) answers `link down`.
+    pub fn link_test(&mut self, payload: &[u8]) -> Result<LinkTest> {
+        LinkTest::from_bytes(&self.request(cmd::LINK_TEST, payload)?)
+    }
+
+    /// The payload, sent back. Checks the protocol port itself, nothing behind it.
+    pub fn echo(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.request(cmd::ECHO, payload)
+    }
+
+    pub fn can_stats(&mut self) -> Result<Vec<CanChannelStats>> {
+        CanChannelStats::list_from_bytes(&self.request(cmd::CAN_STATS, &[])?)
+    }
+
+    pub fn serial_stats(&mut self) -> Result<Vec<SerialPortStats>> {
+        SerialPortStats::list_from_bytes(&self.request(cmd::SERIAL_STATS, &[])?)
     }
 }
 

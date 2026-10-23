@@ -83,6 +83,43 @@ The kernel would otherwise name these in discovery order, which differs per
 controller - `can4`..`can6` on a Moduline IV with four onboard mcp251x
 controllers, `can2`..`can4` on an M1 with two. `81-gocontroll-multibus.rules`
 pins them to the names above; see [go-multibus.md](go-multibus.md#device-names).
+With more than one module the names carry the slot - `mb7_can1` is CAN 1 of the
+module in slot 7 - because two modules would otherwise both claim `mb_can1`.
+
+Every interrupt callback in `usbd_gs_usb.c` turns the peripheral back into a
+channel with `gs_channel_of()`, the reverse of `gs_get_fdcan()`, so the two
+directions cannot disagree. Up to 0.2.0 the receive path had its own table
+with FDCAN1 as channel 0, and frames received on connector interface 1 came out
+on `mb_can3`.
+
+### CAN FD, flow control and bus state
+
+All three channels are CAN FD capable, and since 0.3.0 the module says so to
+the kernel (`GS_CAN_FEATURE_FD` with the data phase limits in
+`GS_USB_BREQ_BT_CONST_EXT`), so a channel takes `fd on dbitrate ...` like any
+other CAN FD controller. Frames with and without bit rate switching, and
+classic frames, can be mixed on an FD channel. Transmitter delay compensation is
+switched on when the data phase prescaler is 1 or 2, the only case ISO 11898-1
+allows it in.
+
+A frame from the host is echoed back when the FDCAN reports it sent, not when
+it arrives over USB. The kernel keeps at most ten frames per channel in flight
+and waits for an echo before it sends more, so that is what throttles a busy
+writer to the bus rate. Echoing on arrival - what 0.2.0 did - let the host
+outrun the three deep FDCAN transmit FIFO, and everything that did not fit was
+dropped without a trace.
+
+The receive FIFO is drained completely on every interrupt, and a frame that
+does not fit in the queue to the host is counted and flagged
+`GS_CAN_FLAG_OVERFLOW`, which the kernel reports as an RX overflow error.
+
+Error warning, error passive and bus-off are passed on as error frames, and
+`GS_USB_BREQ_GET_STATE` answers with the state and both error counters - which
+is where `ip -details link show` gets its `berr-counter` from. gs_usb has no
+`restart-ms`, so a channel that goes bus-off restarts by itself after 100 ms,
+the same as the baseboard's controllers with `restart-ms 100`; the kernel sees
+a bus-off error frame followed by a restarted one. `MB_CMD_CAN_STATS` gives the
+per channel counters behind all of this.
 
 ### CAN and RS485 do not share MCU pins
 
@@ -198,6 +235,27 @@ Do not rely on the `ttyACM` numbers. Find the port by USB interface number
 instead, which is what `enumerate_ports()` in go-multibus' `src/discover.rs` does:
 interface 1, 3 and 5 are the serial bridges for connector interfaces 2, 3 and 4,
 and interface 7 is the module protocol.
+
+### The serial bridges
+
+What the UART receives goes into a 1 KB ring per port and leaves for the host in
+USB packets of at most 63 bytes. Both halves of that matter:
+
+- **The ring.** Up to 0.2.0 the UART received straight into the buffer the USB
+  transfer was sent from, and was re-armed into it while a longer transfer was
+  still going out - the USB peripheral only copies one 64 byte packet into its
+  own memory at a time, so the rest was overwritten. Bytes that arrived while a
+  transfer was in flight were dropped outright.
+- **Short packets only.** A transfer that ends on a full 64 byte packet is not
+  delivered by the host until another packet - or a zero length one - follows.
+  A message of exactly 64 or 128 bytes therefore sat in the controller until the
+  next message pushed it out. Capping every packet at 63 bytes ends each one by
+  itself.
+
+A receive overrun used to end the reception for good: HAL aborts it and nothing
+started it again. `HAL_UART_ErrorCallback()` now counts the error and re-arms.
+`MB_CMD_SERIAL_STATS` reports bytes in and out, bytes dropped and receive errors
+per port.
 
 ## How a configuration is applied
 

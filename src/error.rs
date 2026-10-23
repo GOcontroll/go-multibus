@@ -82,6 +82,13 @@ impl Error {
         matches!(self, Error::Status { status: 0x01, .. })
     }
 
+    /// Whether the module answered with this particular status, so a caller
+    /// can word a refusal (`bad parameter`) or a wrong role (`not supported`)
+    /// for what it means at that point rather than as a raw status.
+    pub fn is_status(&self, code: u8) -> bool {
+        matches!(self, Error::Status { status, .. } if *status == code)
+    }
+
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::User(_) | Error::Status { .. } => 1,

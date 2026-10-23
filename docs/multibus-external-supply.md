@@ -70,7 +70,9 @@ connector.
 
 ### Where it is stored
 
-`MbStore.c` keeps a 16 byte record at `0x0803F800`, the top of flash:
+`MbStore.c` keeps a 16 byte record in the last page of flash - `0x0805F800`
+with the flash in dual bank mode (the factory setting), `0x0803F800` in single
+bank mode:
 
 | Offset | Size | Field                                                        |
 |--------|------|--------------------------------------------------------------|
@@ -87,11 +89,17 @@ Three details decide how that is written:
   multiple of eight bytes and goes out as two `HAL_FLASH_Program()` calls.
 - **The page geometry depends on an option byte.** With `DBANK` set - the
   factory setting on a 256 KB part - the flash is two banks of 128 KB with 2 KB
-  pages; with it clear, one bank with 4 KB pages. `erase_page()` works that out
-  at runtime from `FLASH->OPTR` instead of assuming, and both linker scripts
-  reserve the top **4 KB** so the larger of the two geometries still cannot
-  collide with code. That is what `LENGTH = 236K` in
-  `STM32G474RCTX_FLASH_BOOT.ld` is for.
+  pages; with it clear, one bank with 4 KB pages. `store_addr()` and
+  `erase_page()` work that out at runtime from `FLASH->OPTR` instead of
+  assuming. In single bank mode the linker scripts reserve the top **4 KB**
+  (`LENGTH = 236K` in `STM32G474RCTX_FLASH_BOOT.ld`).
+- **Bank 2 does not follow bank 1.** On a 256 KB part in dual bank mode, bank 2
+  starts at `0x08040000` - the same address it has on a 512 KB part - so its
+  last page is `0x0805F800`, not `0x0803F800`. Up to 0.2.0 the record was
+  written at `0x0803F800` while the erase went to the last page of bank 2:
+  the first save landed on blank flash and worked, every later one hit flash
+  that had never been erased and failed, so the module reported `stored: 0`
+  and came back from a reset with the first value it had ever been given.
 - **A save only happens when something changed.** `MbStore_Save()` compares
   before it erases, so a controller pushing the same configuration on every boot
   costs no erase cycles at all.
@@ -100,10 +108,10 @@ Adding a setting later means taking bytes out of the reserved block and bumping
 `MB_STORE_VERSION`. An older record still validates, so `MbStore_Load()` hands
 it back and the caller fills the new fields with its own defaults.
 
-**A firmware upload wipes it.** The bootloader erases the application area, the
-record included, so a module comes out of a firmware update with its supply off
-until the controller pushes the configuration again - which the next bring-up
-does anyway.
+**A firmware upload leaves it alone.** The bootloader erases 96 KB from
+`0x08004000` and the record lies outside that, so a module comes out of a
+firmware update with the supply it had before. The controller pushes its own
+value on the next bring-up anyway.
 
 ## Who wins: the module or the controller
 

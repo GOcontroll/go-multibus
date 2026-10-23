@@ -1,9 +1,15 @@
 #!/bin/sh
-# Print the deterministic name for one Multibus gs_usb CAN interface.
+# Print the deterministic name for one Multibus gs_usb CAN interface, or the
+# name prefix for one Multibus module.
 #
-# Called from 81-gocontroll-multibus.rules with the kernel name of the netdev
-# being processed. Prints a name like "mb_can3" and nothing else, because udev
-# takes the whole of stdout as the new interface name.
+#   gocontroll-multibus-canname <netdev>            mb_can2, or mb7_can2
+#   gocontroll-multibus-canname --prefix <serial>   mb_, or mb7_
+#
+# Called from 81-gocontroll-multibus.rules: the first form for every netdev the
+# module adds, with its kernel name; the second for every tty, with the USB
+# serial number udev already knows, so the tty rules can put the same prefix
+# on their symlinks. Prints the name and nothing else, because udev takes the
+# whole of stdout as the result.
 #
 # Why this is needed: the kernel numbers CAN interfaces in the order it finds
 # them, and how many it has already found depends on the controller. A Moduline
@@ -22,6 +28,34 @@
 # interface numbers used in MbInterfaces.c. CAN 2 is connector interface 3.
 # See Documentation/multibus-interfaces.md.
 #
+# --- More than one module -----------------------------------------------------
+#
+# Two modules would both claim mb_can1, and the second would keep its kernel
+# name. So with more than one module configured every name carries the slot
+# instead: mb7_can1, /dev/mb7_serial1, /dev/mb7_protocol. Nothing in a uevent
+# says which slot a device is in - both modules have the same ids and the same
+# interfaces - but go-multibus asks every module for its USB serial number over
+# the module bus, which does reach one particular slot, and writes down what it
+# learned, one module per line:
+#
+#   206435A63245 mb7_
+#
+# in /run/gocontroll/multibus-usb-names, with a copy that survives a reboot in
+# /var/lib/go-multibus/usb-names. This looks the device's serial number up
+# there, live copy first.
+#
+# No map at all means one module, and that module gets the mb_ names it has
+# always had - so a controller with one module behaves exactly as before.
+#
+# A map that does not list the serial yet means the module enumerated before
+# go-multibus got round to writing its line, which happens a few hundred
+# milliseconds after the application starts - about when USB comes up. So the
+# live map is polled for up to three seconds before falling back to mb_. Should
+# the fallback still be taken, go-multibus notices the wrong names after
+# enumeration and has udev name those devices again.
+#
+# --- Channel order ------------------------------------------------------------
+#
 # The channel index is recovered from the creation order of the netdevs, which
 # is the order gs_usb registers its channels in. ifindex is the kernel's
 # creation counter, so counting how many siblings have a lower ifindex than this
@@ -37,6 +71,61 @@
 # Counting is safe even when udev runs the events out of order: gs_usb registers
 # every netdev before its uevent can be processed, so all siblings are already
 # present in sysfs whichever one is handled first.
+
+RUN_MAP=/run/gocontroll/multibus-usb-names
+STORE_MAP=/var/lib/go-multibus/usb-names
+SINGLE_PREFIX=mb_
+
+# Print the prefix one map file gives a serial number, or nothing.
+#
+# Only letters, digits and underscores are accepted, because the result ends up
+# in a network interface name and in a /dev symlink; anything else in the file
+# is treated as if the line were not there.
+lookup() {
+    [ -r "$2" ] || return 0
+    # The second test keeps a last line without a newline, as an editor may
+    # leave it.
+    while read -r key value rest || [ -n "$key" ]; do
+        [ "$key" = "$1" ] || continue
+        case "$value" in
+            ""|*[!A-Za-z0-9_]*) return 0 ;;
+        esac
+        printf '%s\n' "$value"
+        return 0
+    done < "$2"
+}
+
+# Print the prefix for a module, waiting for the map to catch up when there is
+# a map that does not know it yet.
+prefix_for() {
+    serial="$1"
+    if [ -n "$serial" ]; then
+        tries=0
+        while :; do
+            found=$(lookup "$serial" "$RUN_MAP")
+            [ -n "$found" ] || found=$(lookup "$serial" "$STORE_MAP")
+            if [ -n "$found" ]; then
+                printf '%s\n' "$found"
+                return 0
+            fi
+
+            # No map at all: one module, the names it has always had.
+            [ -e "$RUN_MAP" ] || [ -e "$STORE_MAP" ] || break
+
+            # 30 x 0.1 s. The service writes the line within a second of the
+            # module starting; three leaves room for a busy boot.
+            [ "$tries" -lt 30 ] || break
+            tries=$((tries + 1))
+            sleep 0.1
+        done
+    fi
+    printf '%s\n' "$SINGLE_PREFIX"
+}
+
+if [ "$1" = "--prefix" ]; then
+    prefix_for "$2"
+    exit 0
+fi
 
 name="$1"
 [ -n "$name" ] || exit 1
@@ -93,9 +182,12 @@ done
 
 [ -n "$channel" ] || exit 1
 
+# The netdev hangs off a USB interface; the serial number lives on the USB
+# device that interface belongs to, one directory up.
+serial=$(cat "${usbif%/*}/serial" 2>/dev/null)
+prefix=$(prefix_for "$serial")
+
 case "$channel" in
-    0) printf 'mb_can1\n' ;;
-    1) printf 'mb_can2\n' ;;
-    2) printf 'mb_can3\n' ;;
+    0|1|2) printf '%scan%d\n' "$prefix" $((channel + 1)) ;;
     *) exit 1 ;;   # more channels than this firmware has: leave the name alone
 esac

@@ -5,7 +5,7 @@
 # publishes is what you can build and inspect locally:
 #
 #     cargo zigbuild --release --target aarch64-unknown-linux-musl
-#     debian/build-deb.sh 0.2.0 /tmp/dist
+#     debian/build-deb.sh 0.3.0 /tmp/dist
 #
 # The tools are Rust binaries for the controller, so the package is
 # Architecture: arm64 and something must have built them before this runs.
@@ -54,7 +54,9 @@ Description: GOcontroll Multibus module service and utilities
  so the three tools look and behave the same way.
  .
  Deterministic device names (mb_can1..3, /dev/mb_serial1..3, /dev/mb_protocol)
- are installed as udev rules.
+ are installed as udev rules. With more than one module configured the names
+ carry the slot (mb7_can1, /dev/mb7_protocol), tied to each module by its USB
+ serial number.
 CONTROL
 
 cat > "${BUILD}/DEBIAN/postinst" << 'POSTINST'
@@ -129,6 +131,9 @@ case "$1" in
     purge)
         rm -f /etc/gocontroll/multibus.json
         rm -rf /dev/shm/gocontroll
+        # The name map of a controller with more than one module.
+        rm -rf /var/lib/go-multibus
+        rm -f /run/gocontroll/multibus-usb-names
         ;;
 esac
 # The OTG port is deliberately left in host mode on removal: reverting it needs

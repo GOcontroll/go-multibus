@@ -11,6 +11,7 @@
 //! | [`link`] | one open connection to the protocol port over USB |
 //! | [`modulebus`] | the SPI link that exists before USB does |
 //! | [`discover`] | finding the module's ttys and CAN interfaces |
+//! | [`namemap`] | which USB device gets which names when there are several modules |
 //! | [`config`] | `/etc/gocontroll/multibus.json` |
 //! | [`service`] | the bring-up state machine both the daemon and the UI run |
 //! | [`shm`] | the documents published to `/dev/shm` |
@@ -19,12 +20,17 @@
 //! Two links reach the same module, each for what it is good at. The module bus
 //! (SPI) exists before USB, so it carries the configuration; USB carries the
 //! cell data, which is far too large for a 46 byte module bus message.
+//!
+//! A controller can carry more than one module. The module bus reaches a slot
+//! and USB reaches a device, and the USB serial number - which the module
+//! reports over both - is what ties the two together.
 
 pub mod config;
 pub mod discover;
 pub mod error;
 pub mod link;
 pub mod modulebus;
+pub mod namemap;
 pub mod proto;
 pub mod service;
 pub mod shm;
