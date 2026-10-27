@@ -358,7 +358,9 @@ tooling says so rather than reporting a vague timeout.
 
 The external supply needs **0.2.0 or later**. On an older image everything else
 works and the supply row reads `not supported by this firmware`, which is
-reported once rather than on every bring-up.
+reported once rather than on every bring-up. On 0.2.0 the connector gets about
+20 % more than the setpoint - 6 V for 5 V, 13.2 V for 11 V - because that image
+assumed a smaller opamp gain than the board has; 0.3.0 is calibrated to it.
 
 **Two modules on one controller, the runtime isoSPI role and `IDENTITY` need
 0.3.0 or later.** With more than one module configured an older image fails

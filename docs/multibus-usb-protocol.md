@@ -188,7 +188,8 @@ rises points at signal integrity.
 
 ### 0x11 LINK_DIAG
 
-Request: empty. Answer: 32 bytes about the master watchdog.
+Request: empty. Answer: 32 bytes about the master watchdog, and on a slave how
+long re-arming takes.
 
 | Offset | Size | Field                                                   |
 |--------|------|---------------------------------------------------------|
@@ -197,10 +198,11 @@ Request: empty. Answer: 32 bytes about the master watchdog.
 | 8      | 4    | SPI2 CR1                                                 |
 | 12     | 4    | SPI2 CR2                                                 |
 | 16     | 4    | HAL error code                                           |
-| 20     | 2    | Bytes HAL still had to send                              |
-| 22     | 2    | Bytes HAL still had to receive                           |
+| 20     | 2    | Bytes the transmit DMA still had to move                 |
+| 22     | 2    | Bytes the receive DMA still had to move                  |
 | 24     | 1    | HAL state                                                |
-| 25     | 3    | Reserved                                                 |
+| 25     | 1    | Reserved                                                 |
+| 26     | 2    | Slave: longest re-arm after a frame, in us               |
 | 28     | 4    | Module tick of the last stall, in ms                     |
 
 A master transaction takes 1.2 ms. One that is still running after 20 ms never
@@ -211,6 +213,17 @@ sent, HAL waited for two more received bytes, and the receive FIFO held one -
 with the FIFO threshold at two bytes, the interrupt that would have finished
 the transfer never came. The watchdog keeps this record, resets SPI2 and
 releases chip select, which costs one transaction instead of the link.
+
+That was with interrupt driven transfers. Since they moved to DMA the stall has
+not been seen again - 0 in 2000 link tests alone and in 7500 under load, where
+interrupts had seen 51 - and the watchdog stays as a safety net.
+
+A slave re-arms after every frame: SPI2 is reset and armed with the next
+answer, with interrupts off. A master that started clocking in that window
+would lose the frame, so the slave keeps the longest re-arm it has done - 22 us
+on a G474 at 170 MHz - and the master holds the clock off for 30 us after
+pulling chip select low. The slave only starts a re-arm while chip select is
+high, so it is always ready by the first clock.
 
 ### 0x20 CELLS_READ
 

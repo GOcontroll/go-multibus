@@ -21,15 +21,19 @@ Two MCU pins drive it, and there is no third:
 | `LDO_EN`  | PC4 | Regulator enable, active high.                 |
 
 Between the DAC and the regulator sits an opamp stage that amplifies the DAC's
-0..3V3 to 0..15 V, so the transfer is linear and the code for a setpoint is a
-straight proportion of the 12 bit range:
+output, and the transfer is linear, so two points fix the code for a setpoint:
+the output at DAC code 0 and at full scale.
 
 ```
-   DAC code = setpoint_mV * 4095 / 15000
+   DAC code = (setpoint_mV - 57) * 4095 / (18007 - 57)
 ```
 
-`MB_SUPPLY_FULL_SCALE_MV` in `MbSupply.h` is the only place that 15000 appears.
-A board that measures out differently is trimmed there and nowhere else.
+`MB_SUPPLY_ZERO_MV` and `MB_SUPPLY_FULL_SCALE_MV` in `MbSupply.h` are the only
+place those numbers appear. They were measured on a 20-30-4-2 board: with the
+nominal 0..15 V the firmware assumed before, asking for 5 V gave 6.04 V and
+11 V gave 13.22 V - the stage amplifies 5.44x, not 4.55x, and the top of the
+DAC range would have put 18 V on the connector. A board that measures out
+differently is trimmed there and nowhere else.
 
 **There is no feedback path from the regulator output back into the MCU.**
 Everything the module reports about the supply is the setpoint it was given, not

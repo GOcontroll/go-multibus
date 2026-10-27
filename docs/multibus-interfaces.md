@@ -252,8 +252,13 @@ USB packets of at most 63 bytes. Both halves of that matter:
   next message pushed it out. Capping every packet at 63 bytes ends each one by
   itself.
 
-A receive overrun used to end the reception for good: HAL aborts it and nothing
-started it again. `HAL_UART_ErrorCallback()` now counts the error and re-arms.
+The UART receives by circular DMA into a 256 byte buffer, which is emptied into
+the ring at half full, full and when the line goes idle - at 921600 baud that
+leaves the CPU 1.4 ms to get round to it. Before, an interrupt had to empty the
+8 byte UART FIFO within 87 us, and with the CAN, USB and isoSPI interrupts busy
+that failed often enough to cost one message in twelve under full load.
+Framing, noise and parity errors are counted, not acted on: HAL would abort a
+DMA reception for any of them and throw away what sits in the buffer.
 `MB_CMD_SERIAL_STATS` reports bytes in and out, bytes dropped and receive errors
 per port.
 
