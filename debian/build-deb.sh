@@ -75,8 +75,14 @@ case "$1" in
         # controller under it, and on real hardware the service resets the
         # module and raises CAN interfaces - not something an install should do
         # underneath a running machine.
-        systemctl enable gocontroll-usb-hostmode.service || true
-        systemctl enable go-multibus.service || true
+        #
+        # First install only ($2, the previously configured version, is
+        # empty). On an upgrade both services keep the state they had:
+        # disabled stays disabled.
+        if [ -z "$2" ]; then
+            systemctl enable gocontroll-usb-hostmode.service || true
+            systemctl enable go-multibus.service || true
+        fi
 
         # Host mode is applied here rather than left to the service on the next
         # boot. The change lands in the u-boot environment and the Falcon boot
@@ -115,11 +121,10 @@ cat > "${BUILD}/DEBIAN/prerm" << 'PRERM'
 set -e
 case "$1" in
     remove|purge)
+        # Stop only. The enable links stay until purge, so a reinstall after
+        # a remove comes back in the same state.
         systemctl stop go-multibus.service || true
-        systemctl disable go-multibus.service || true
         systemctl stop gocontroll-cellmon.service || true
-        systemctl disable gocontroll-cellmon.service || true
-        systemctl disable gocontroll-usb-hostmode.service || true
         ;;
 esac
 PRERM
@@ -134,6 +139,11 @@ case "$1" in
         # The name map of a controller with more than one module.
         rm -rf /var/lib/go-multibus
         rm -f /run/gocontroll/multibus-usb-names
+        for unit in go-multibus.service gocontroll-cellmon.service \
+                gocontroll-usb-hostmode.service; do
+            find /etc/systemd/system -type l -path '*.wants/*' \
+                -name "$unit" -delete 2>/dev/null || true
+        done
         ;;
 esac
 # The OTG port is deliberately left in host mode on removal: reverting it needs
