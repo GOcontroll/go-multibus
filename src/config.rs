@@ -93,6 +93,18 @@ fn default_supply_mv() -> u16 {
     5000
 }
 
+/// Index into the `interfaces` list of the connector interface behind each
+/// gs_usb channel: channel 0 is interface 1, channels 1 and 2 are interfaces
+/// 3 and 4. Interface 2 has no CAN.
+pub const CAN_CHANNEL_INTERFACES: [usize; 3] = [0, 2, 3];
+
+/// The gs_usb channel behind an index into the `interfaces` list, if any.
+pub fn can_channel_of(interface: usize) -> Option<usize> {
+    CAN_CHANNEL_INTERFACES
+        .iter()
+        .position(|candidate| *candidate == interface)
+}
+
 /// One module's settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModuleConfig {
@@ -209,14 +221,30 @@ impl ModuleConfig {
     /// [`crate::discover::enumerate_can_interfaces`] for why the two are not
     /// interchangeable.
     pub fn can_channels(&self) -> Result<Vec<usize>> {
+        Ok(self
+            .can_buses()?
+            .into_iter()
+            .map(|(channel, _)| channel)
+            .collect())
+    }
+
+    /// The live channels, each with whether it is to run CAN FD.
+    ///
+    /// Classic or FD is this file's to say - it is part of what the interface
+    /// is - and go-can is told on every bring-up. The bitrates, nominal and
+    /// data, stay go-can's.
+    pub fn can_buses(&self) -> Result<Vec<(usize, bool)>> {
         let modes = self.interface_modes()?;
-        let mut channels = vec![0usize];
-        for (channel, interface) in [(1usize, 2usize), (2, 3)] {
-            if modes[interface] == Mode::Can {
-                channels.push(channel);
+        let mut buses = Vec::new();
+        for (channel, interface) in CAN_CHANNEL_INTERFACES.iter().enumerate() {
+            let mode = modes[*interface];
+            // Interface 1 has no other transceiver, so a file that says
+            // anything else there still gets its channel, as it always did.
+            if mode.is_can() || channel == 0 {
+                buses.push((channel, mode == Mode::CanFd));
             }
         }
-        Ok(channels)
+        Ok(buses)
     }
 }
 
@@ -909,6 +937,47 @@ mod tests {
 
         module.set_interface(3, Mode::Rs485).unwrap();
         assert_eq!(module.can_channels().unwrap(), vec![0, 2]);
+    }
+
+    #[test]
+    fn can_fd_is_a_mode_of_its_own_in_the_file_and_can_on_the_wire() {
+        let mut module = ModuleConfig::new(8);
+        module.set_interface(1, Mode::CanFd).unwrap();
+        module.set_interface(4, Mode::CanFd).unwrap();
+        assert_eq!(
+            module.interfaces,
+            vec!["canfd", "rs485", "can", "canfd", "isospi"]
+        );
+        assert_eq!(
+            module.can_buses().unwrap(),
+            vec![(0, true), (1, false), (2, true)]
+        );
+
+        let wire: Vec<u8> = module
+            .interface_modes()
+            .unwrap()
+            .iter()
+            .map(|mode| mode.as_byte())
+            .collect();
+        assert_eq!(wire, vec![1, 2, 1, 1, 4]);
+
+        // Interface 2 has no CAN transceiver, classic or FD.
+        assert!(module.set_interface(2, Mode::CanFd).is_err());
+    }
+
+    #[test]
+    fn what_the_module_reports_takes_the_fd_choice_of_the_file() {
+        use crate::proto::adopt_fd;
+        let wanted = [Mode::CanFd, Mode::Rs485, Mode::Can, Mode::CanFd, Mode::IsoSpi];
+        let reported = [Mode::Can, Mode::Rs485, Mode::Can, Mode::Rs485, Mode::IsoSpi];
+        assert_eq!(
+            adopt_fd(&reported, &wanted),
+            vec![Mode::CanFd, Mode::Rs485, Mode::Can, Mode::Rs485, Mode::IsoSpi],
+            "a refused interface stays what the module has"
+        );
+        assert_eq!(can_channel_of(0), Some(0));
+        assert_eq!(can_channel_of(1), None);
+        assert_eq!(can_channel_of(3), Some(2));
     }
 
     #[test]

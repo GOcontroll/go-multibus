@@ -40,13 +40,13 @@
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::{ModuleConfig, ModuleSetup};
+use crate::config::{can_channel_of, ModuleConfig, ModuleSetup};
 use crate::discover::{self, Names, UsbModule};
 use crate::error::{Error, Result};
 use crate::link::MultibusLink;
 use crate::modulebus::{self, Answer, ModuleBus};
 use crate::namemap;
-use crate::proto::{status, CellSnapshot, Info, LinkStatus, Mode, Role, Supply};
+use crate::proto::{adopt_fd, status, CellSnapshot, Info, LinkStatus, Mode, Role, Supply};
 use crate::shm;
 
 /// How long to wait for USB to enumerate after the application starts. The
@@ -182,6 +182,66 @@ fn run_bounded(program: &str, args: &[&str], limit: Duration) -> Option<std::pro
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// Like [`run_bounded`], for a command whose answer is its output. `None` when
+/// it could not be run, ran too long or failed.
+fn run_captured(program: &str, args: &[&str], limit: Duration) -> Option<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // The answers asked for here are a few hundred bytes, far below what a
+    // pipe holds, so the child never blocks on a reader that is still waiting.
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Whether go-can has CAN FD stored for this interface. `None` when go-can is
+/// not installed or has no configuration for the interface.
+fn go_can_stored_fd(name: &str) -> Option<bool> {
+    let text = run_captured("go-can", &["--json", "show", name], Duration::from_secs(10))?;
+    stored_fd_in(&text)
+}
+
+/// The `fd` of the stored configuration in `go-can --json show`.
+fn stored_fd_in(text: &str) -> Option<bool> {
+    let document: serde_json::Value = serde_json::from_str(text).ok()?;
+    document.get("config")?.get("fd")?.as_bool()
+}
+
+fn can_flavour(fd: bool) -> &'static str {
+    if fd {
+        "CAN FD"
+    } else {
+        "CAN"
+    }
+}
+
+/// Data bitrate of a CAN FD bus that go-can has no configuration for. The
+/// same as go-can's own default for a new FD bus, so both routes give one bus.
+const FALLBACK_DATA_BITRATE: u32 = 2_000_000;
 
 pub struct Supervisor {
     pub config: ModuleConfig,
@@ -427,7 +487,7 @@ impl Supervisor {
             )));
         }
 
-        self.applied_interfaces = active;
+        self.applied_interfaces = adopt_fd(&active, &modes);
         self.configure_over_usb = false;
         let applied: Vec<&str> = self
             .applied_interfaces
@@ -910,7 +970,8 @@ impl Supervisor {
         if self.configure_over_usb {
             let wanted = self.config.interface_modes()?;
             let applied = link.set_interfaces(&wanted)?;
-            if applied.modes != wanted {
+            let on_wire: Vec<Mode> = wanted.iter().map(|mode| mode.on_wire()).collect();
+            if applied.modes != on_wire {
                 let asked: Vec<&str> = wanted.iter().map(|mode| mode.as_str()).collect();
                 return Err(Error::module(format!(
                     "the module refused the interface combination {}; it kept {}",
@@ -926,13 +987,14 @@ impl Supervisor {
 
         // Read back what the module actually has, which also covers the case
         // where the SPI configuration did not land.
-        self.applied_interfaces = link.get_interfaces()?.modes;
+        let wanted = self.config.interface_modes().unwrap_or_default();
+        self.applied_interfaces = adopt_fd(&link.get_interfaces()?.modes, &wanted);
 
         self.link = Some(link);
         self.settle_supply_over_usb()?;
 
         if self.config.bring_up_can {
-            self.bring_up_can()?;
+            self.bring_up_can(None)?;
         }
 
         self.state = State::Running;
@@ -1015,7 +1077,14 @@ impl Supervisor {
     /// `/etc/gocontroll/can.d/`. Setting a bitrate here as well would make the
     /// two tools disagree: go-can would keep reporting its stored value while
     /// the interface actually ran at ours.
-    fn bring_up_can(&mut self) -> Result<()> {
+    ///
+    /// Classic CAN or CAN FD is the exception, because it is part of the
+    /// interface mode and that is ours: each bus is raised the way the mode
+    /// says, and go-can's stored `fd` is brought in line with it.
+    ///
+    /// `only` limits the work to one gs_usb channel, for a change that
+    /// concerns a single bus.
+    fn bring_up_can(&mut self, only: Option<usize>) -> Result<()> {
         // Wait for udev's queue to drain before looking. Polling for the names
         // races with the renames; this waits for the events themselves.
         run_bounded("udevadm", &["settle", "--timeout=5"], Duration::from_secs(10));
@@ -1045,7 +1114,10 @@ impl Supervisor {
             return Ok(());
         }
 
-        for channel in self.config.can_channels()? {
+        for (channel, fd) in self.config.can_buses()? {
+            if only.is_some_and(|wanted| wanted != channel) {
+                continue;
+            }
             let name = interfaces[channel].clone();
 
             // A netdev still on the wrong name is about to be renamed, or
@@ -1059,12 +1131,40 @@ impl Supervisor {
                 }
             }
 
-            if self.apply_can_with_go_can(&name) {
+            if self.apply_can_with_go_can(&name, fd) {
                 continue;
             }
-            self.apply_can_with_ip(&name);
+            self.apply_can_with_ip(&name, fd);
         }
         Ok(())
+    }
+
+    /// Switch one interface between classic CAN and CAN FD without a reset.
+    ///
+    /// Both are the same mode to the module - the same transceiver, the same
+    /// FDCAN - so nothing has to be pushed to it: only the Linux interface of
+    /// that one bus is configured again. Returns false when the module is not
+    /// up; the stored mode then takes effect with the next bring-up.
+    pub fn apply_can_flavour(&mut self, interface: usize) -> Result<bool> {
+        let Some(channel) = can_channel_of(interface) else {
+            return Ok(false);
+        };
+        if self.state != State::Running || !self.config.bring_up_can {
+            return Ok(false);
+        }
+        self.bring_up_can(Some(channel))?;
+
+        // The module has CAN either way; what changed is which of the two the
+        // configuration calls it.
+        let wanted = self.config.interface_modes()?;
+        if let (Some(applied), Some(mode)) =
+            (self.applied_interfaces.get_mut(interface), wanted.get(interface))
+        {
+            if applied.is_can() && mode.is_can() {
+                *applied = *mode;
+            }
+        }
+        Ok(true)
     }
 
     /// Let go-can configure and raise the interface. False if it could not.
@@ -1072,34 +1172,82 @@ impl Supervisor {
     /// Fails when go-can is absent, or when it has no config for this interface
     /// yet — a fresh controller that has never had a module in it. The caller
     /// falls back in both cases.
-    fn apply_can_with_go_can(&mut self, name: &str) -> bool {
-        let Some(status) = run_bounded("go-can", &["apply", name], Duration::from_secs(15)) else {
+    ///
+    /// go-can keeps `fd` next to the bitrates, and what it has stored may not
+    /// be what the interface mode says - the mode was changed, or someone set
+    /// `fd` with go-can. The mode wins: where the two differ, go-can is told,
+    /// which stores the value and applies it in one go. Where they agree, the
+    /// stored configuration is applied as it is.
+    fn apply_can_with_go_can(&mut self, name: &str, fd: bool) -> bool {
+        let Some(stored_fd) = go_can_stored_fd(name) else {
             return false;
         };
-        if !status.success() {
+
+        let status = if stored_fd == fd {
+            run_bounded("go-can", &["apply", name], Duration::from_secs(15))
+        } else {
+            let value = if fd { "on" } else { "off" };
+            run_bounded(
+                "go-can",
+                &["--quiet", "set", name, "fd", value],
+                Duration::from_secs(15),
+            )
+        };
+        if !status.is_some_and(|status| status.success()) {
+            self.log(format!(
+                "go-can could not bring up {name} as {}",
+                can_flavour(fd)
+            ));
             return false;
         }
-        self.log(format!("{name} up, configured by go-can"));
+        self.log(format!(
+            "{name} up as {}, configured by go-can",
+            can_flavour(fd)
+        ));
         true
     }
 
-    /// Raise the interface directly, for a controller without go-can.
-    fn apply_can_with_ip(&mut self, name: &str) {
+    /// Raise the interface directly, for a controller without go-can or a bus
+    /// go-can has no configuration for yet.
+    fn apply_can_with_ip(&mut self, name: &str, fd: bool) {
         let bitrate = self.config.can_bitrate.to_string();
+        let data_bitrate = FALLBACK_DATA_BITRATE.to_string();
         run_bounded("ip", &["link", "set", name, "down"], Duration::from_secs(10));
 
-        let raised = run_bounded(
-            "ip",
-            &["link", "set", name, "up", "type", "can", "bitrate", &bitrate],
-            Duration::from_secs(10),
-        );
+        // `fd off` is said out loud: an interface keeps its FD setting over a
+        // down and up, so leaving the word out would leave a bus that ran FD
+        // before in FD.
+        let mut args = vec!["link", "set", name, "up", "type", "can", "bitrate", &bitrate];
+        if fd {
+            args.extend(["fd", "on", "dbitrate", &data_bitrate]);
+        } else {
+            args.extend(["fd", "off"]);
+        }
+        let mut raised = run_bounded("ip", &args, Duration::from_secs(10));
+
+        // Firmware older than 0.3.0 does not offer FD to the kernel at all;
+        // classic CAN needs no word about it there.
+        if !fd && !raised.is_some_and(|status| status.success()) {
+            raised = run_bounded(
+                "ip",
+                &["link", "set", name, "up", "type", "can", "bitrate", &bitrate],
+                Duration::from_secs(10),
+            );
+        }
 
         match raised {
-            Some(status) if status.success() => {
-                self.log(format!("{name} up at {bitrate} bit/s (go-can not available)"))
-            }
+            Some(status) if status.success() && fd => self.log(format!(
+                "{name} up as CAN FD at {bitrate} bit/s, data {data_bitrate} bit/s \
+                 (no go-can configuration)"
+            )),
+            Some(status) if status.success() => self.log(format!(
+                "{name} up as CAN at {bitrate} bit/s (no go-can configuration)"
+            )),
             // A CAN interface that will not come up is worth reporting but must
             // not stop the cell data from being published.
+            _ if fd => self.log(format!(
+                "could not bring up {name} as CAN FD; firmware older than 0.3.0 has none"
+            )),
             _ => self.log(format!("could not bring up {name}")),
         }
     }
@@ -1354,5 +1502,26 @@ impl Supervisor {
             }
             Err(failure) => Err(failure),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stored_fd_is_read_from_go_can_show() {
+        let configured = r#"{"schema_version":1,"name":"mb_can1","present":true,
+            "config":{"bitrate":500000,"data_bitrate":2000000,"fd":true,"restart_ms":0},
+            "config_path":"/etc/gocontroll/can.d/mb_can1.conf","live":null}"#;
+        assert_eq!(stored_fd_in(configured), Some(true));
+
+        let classic = r#"{"config":{"bitrate":250000,"fd":false}}"#;
+        assert_eq!(stored_fd_in(classic), Some(false));
+
+        // No configuration yet: the caller raises the bus itself.
+        let unconfigured = r#"{"schema_version":1,"name":"mb_can1","config":null}"#;
+        assert_eq!(stored_fd_in(unconfigured), None);
+        assert_eq!(stored_fd_in("not json"), None);
     }
 }

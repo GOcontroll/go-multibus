@@ -422,6 +422,10 @@ fn supply_choices(reported: Option<Supply>) -> Vec<SupplyChoice> {
 /// An interface change means re-doing the transceiver setup and, on the Linux
 /// side, a different set of CAN channels and serial ports — which is a
 /// bring-up, not a live edit. The supply is the opposite; see below.
+///
+/// Between CAN and CAN FD is the exception. The module has one CAN mode, so
+/// nothing changes there: only the Linux interface of that bus is configured
+/// again, and the module and its other buses are left alone.
 fn apply_mode(
     supervisor: &mut Supervisor,
     config_path: &str,
@@ -429,8 +433,19 @@ fn apply_mode(
     mode: Mode,
 ) -> Result<()> {
     let number = INTERFACES[index].number;
+    let before = supervisor
+        .config
+        .interface_modes()
+        .ok()
+        .and_then(|modes| modes.get(index).copied());
+
     supervisor.config.set_interface(number, mode)?;
     store_module(config_path, &supervisor.config)?;
+
+    let flavour_only = before.is_some_and(|before| before.is_can() && mode.is_can());
+    if flavour_only && supervisor.apply_can_flavour(index)? {
+        return Ok(());
+    }
     supervisor.restart(true);
     Ok(())
 }
@@ -615,26 +630,28 @@ fn draw_list(stdout: &mut impl Write, supervisor: &Supervisor, cursor: usize) ->
 
                 if let Some(active) = active {
                     let live = active[*interface];
-                    if live != mode {
+                    // The module has one CAN mode for classic and FD, so the
+                    // two are compared as the module knows them.
+                    if live.on_wire() != mode.on_wire() {
                         queue!(
                             stdout,
                             SetForegroundColor(Color::Red),
                             Print(format!("module has {}", live.label())),
                             ResetColor,
                         )?;
-                    } else if spec.modes.len() == 1 {
+                    } else if always_can(spec) {
                         queue!(
                             stdout,
                             SetForegroundColor(Color::DarkGrey),
-                            Print("fixed"),
+                            Print("always a CAN bus"),
                             ResetColor
                         )?;
                     }
-                } else if spec.modes.len() == 1 {
+                } else if always_can(spec) {
                     queue!(
                         stdout,
                         SetForegroundColor(Color::DarkGrey),
-                        Print("fixed"),
+                        Print("always a CAN bus"),
                         ResetColor
                     )?;
                 }
@@ -786,6 +803,11 @@ fn draw_log(stdout: &mut impl Write, log: &Log) -> Result<()> {
     Ok(())
 }
 
+/// An interface whose only choice is between classic CAN and CAN FD.
+fn always_can(spec: &crate::proto::InterfaceSpec) -> bool {
+    spec.modes.iter().all(|mode| mode.is_can())
+}
+
 fn draw_mode_picker(
     stdout: &mut impl Write,
     supervisor: &Supervisor,
@@ -812,20 +834,29 @@ fn draw_mode_picker(
         draw_choice(stdout, mode.label(), index == cursor, current == Some(*mode))?;
     }
 
-    hint(
-        stdout,
-        "\u{2191}/\u{2193} navigate   Enter apply (resets the module)   \u{2190}/Esc back",
-    )?;
-
-    if spec.modes.len() == 1 {
-        queue!(
+    if always_can(spec) {
+        hint(
             stdout,
-            Print("\r\n"),
-            SetForegroundColor(Color::DarkGrey),
-            Print("  This interface is not configurable.\r\n"),
-            ResetColor,
+            "\u{2191}/\u{2193} navigate   Enter apply   \u{2190}/Esc back",
+        )?;
+    } else {
+        hint(
+            stdout,
+            "\u{2191}/\u{2193} navigate   Enter apply (resets the module)   \u{2190}/Esc back",
         )?;
     }
+
+    queue!(
+        stdout,
+        Print("\r\n"),
+        SetForegroundColor(Color::DarkGrey),
+        Print(if always_can(spec) {
+            "  This interface is always a CAN bus. Bitrates are set with go-can.\r\n"
+        } else {
+            "  Between CAN and CAN FD applies without a reset. Bitrates are set with go-can.\r\n"
+        }),
+        ResetColor,
+    )?;
 
     draw_error(stdout, error)
 }

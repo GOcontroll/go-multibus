@@ -65,7 +65,7 @@ enum Command {
         slot: Option<u8>,
         /// Connector interface, 1..5.
         interface: u8,
-        /// can, rs485, rs232, isospi or off.
+        /// can, canfd, rs485, rs232, isospi or off.
         mode: String,
     },
 
@@ -438,6 +438,9 @@ fn set_interface(config_path: &str, slot: Option<u8>, interface: u8, mode: &str)
         slot_prefix(&config, slot),
         mode.as_str()
     );
+    if mode.is_can() {
+        println!("bitrates are set with go-can; with canfd that is the data bitrate too");
+    }
     println!("restart the service for it to take effect: systemctl restart go-multibus");
     Ok(())
 }

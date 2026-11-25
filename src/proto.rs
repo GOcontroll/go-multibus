@@ -86,11 +86,21 @@ pub mod flag {
 
 // ── Interface modes ──────────────────────────────────────────────────────────
 
-/// Mode of one connector interface, matching `MbIfMode_t`.
+/// Mode of one connector interface, matching `MbIfMode_t` - with one addition.
+///
+/// The module knows one CAN mode: it switches a transceiver, and the FDCAN
+/// behind it does classic CAN and CAN FD alike. Whether the bus runs classic
+/// or FD is decided on the Linux side, when the network interface is
+/// configured. The controller's configuration still has to say which, so
+/// `Can` and `CanFd` are two modes here and one byte on the wire; see
+/// [`Mode::on_wire`] and [`adopt_fd`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
     Off,
+    /// Classic CAN: frames of up to 8 bytes at one bitrate.
     Can,
+    /// CAN FD: frames of up to 64 bytes, with a second bitrate for the data.
+    CanFd,
     Rs485,
     Rs232,
     IsoSpi,
@@ -111,7 +121,7 @@ impl Mode {
     pub fn as_byte(self) -> u8 {
         match self {
             Mode::Off => 0,
-            Mode::Can => 1,
+            Mode::Can | Mode::CanFd => 1,
             Mode::Rs485 => 2,
             Mode::Rs232 => 3,
             Mode::IsoSpi => 4,
@@ -125,6 +135,7 @@ impl Mode {
         match self {
             Mode::Off => "off",
             Mode::Can => "can",
+            Mode::CanFd => "canfd",
             Mode::Rs485 => "rs485",
             Mode::Rs232 => "rs232",
             Mode::IsoSpi => "isospi",
@@ -136,7 +147,8 @@ impl Mode {
     pub fn label(self) -> &'static str {
         match self {
             Mode::Off => "off",
-            Mode::Can => "CAN FD",
+            Mode::Can => "CAN",
+            Mode::CanFd => "CAN FD",
             Mode::Rs485 => "RS485",
             Mode::Rs232 => "RS232",
             Mode::IsoSpi => "isoSPI",
@@ -147,14 +159,46 @@ impl Mode {
         match name.trim().to_ascii_lowercase().as_str() {
             "off" => Ok(Mode::Off),
             "can" => Ok(Mode::Can),
+            "canfd" | "can-fd" | "can_fd" => Ok(Mode::CanFd),
             "rs485" => Ok(Mode::Rs485),
             "rs232" => Ok(Mode::Rs232),
             "isospi" => Ok(Mode::IsoSpi),
             other => Err(Error::user(format!(
-                "unknown interface mode {other}; pick from can, rs485, rs232, isospi, off"
+                "unknown interface mode {other}; pick from can, canfd, rs485, rs232, isospi, off"
             ))),
         }
     }
+
+    /// The mode as the module knows it: CAN FD is CAN there.
+    pub fn on_wire(self) -> Mode {
+        match self {
+            Mode::CanFd => Mode::Can,
+            other => other,
+        }
+    }
+
+    /// Whether a CAN transceiver is live in this mode, classic or FD.
+    pub fn is_can(self) -> bool {
+        matches!(self, Mode::Can | Mode::CanFd)
+    }
+}
+
+/// What the module reports, with the classic/FD choice of the configuration
+/// put back in.
+///
+/// The module answers `Can` for an interface in either CAN mode. Where the
+/// configuration asked for CAN FD and the module has CAN, the interface is
+/// what was asked for, and saying `CanFd` keeps the published documents and
+/// the UI from showing a difference that is not one.
+pub fn adopt_fd(reported: &[Mode], wanted: &[Mode]) -> Vec<Mode> {
+    reported
+        .iter()
+        .enumerate()
+        .map(|(index, mode)| match (mode, wanted.get(index)) {
+            (Mode::Can, Some(Mode::CanFd)) => Mode::CanFd,
+            _ => *mode,
+        })
+        .collect()
 }
 
 /// The connector interfaces, numbered 1..5 as the pins are on the connector.
@@ -170,10 +214,10 @@ pub struct InterfaceSpec {
 }
 
 pub const INTERFACES: [InterfaceSpec; 5] = [
-    InterfaceSpec { number: 1, pins: "6/5", modes: &[Mode::Can] },
+    InterfaceSpec { number: 1, pins: "6/5", modes: &[Mode::Can, Mode::CanFd] },
     InterfaceSpec { number: 2, pins: "12/13", modes: &[Mode::Rs485, Mode::Rs232, Mode::Off] },
-    InterfaceSpec { number: 3, pins: "18/19", modes: &[Mode::Rs485, Mode::Can, Mode::Off] },
-    InterfaceSpec { number: 4, pins: "24/25", modes: &[Mode::Rs485, Mode::Can, Mode::Off] },
+    InterfaceSpec { number: 3, pins: "18/19", modes: &[Mode::Rs485, Mode::Can, Mode::CanFd, Mode::Off] },
+    InterfaceSpec { number: 4, pins: "24/25", modes: &[Mode::Rs485, Mode::Can, Mode::CanFd, Mode::Off] },
     InterfaceSpec { number: 5, pins: "isoSPI", modes: &[Mode::IsoSpi, Mode::Off] },
 ];
 

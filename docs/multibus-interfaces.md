@@ -21,10 +21,10 @@ Pin numbers are for the 26 position uneven slot.
 
 | Interface | Pins  | Modes           | MCU peripheral per mode                | Transceiver control |
 |-----------|-------|-----------------|----------------------------------------|---------------------|
-| 1         | 6/5   | CAN FD, fixed   | FDCAN3 (PB3/PB4)                       | STB on PB7          |
+| 1         | 6/5   | CAN or CAN FD   | FDCAN3 (PB3/PB4)                       | STB on PB7          |
 | 2         | 12/13 | RS485 or RS232  | USART2 (PA2/PA3) or LPUART1 (PC0/PC1)  | RS485-B DE//RE on PB10/PB11 |
-| 3         | 18/19 | RS485 or CAN FD | USART1 (PA9/PA10) or FDCAN2 (PB12/PB6) | RS485-A DE//RE on PC6/PC7, STB on PD2 |
-| 4         | 24/25 | RS485 or CAN FD | UART4 (PC10/PC11) or FDCAN1 (PB8/PB9)  | RS485-C DE//RE on PB1/PA1, STB on PC12 |
+| 3         | 18/19 | RS485, CAN or CAN FD | USART1 (PA9/PA10) or FDCAN2 (PB12/PB6) | RS485-A DE//RE on PC6/PC7, STB on PD2 |
+| 4         | 24/25 | RS485, CAN or CAN FD | UART4 (PC10/PC11) or FDCAN1 (PB8/PB9)  | RS485-C DE//RE on PB1/PA1, STB on PC12 |
 | 5         | -     | isoSPI, fixed   | SPI2 (PB13/14/15) through the LTC6820  | EN on PC3 (v2) / PC0 (v1) |
 
 ### Neither the RS485 nor the CAN labels follow the interface numbers
@@ -102,6 +102,15 @@ classic frames, can be mixed on an FD channel. Transmitter delay compensation is
 switched on when the data phase prescaler is 1 or 2, the only case ISO 11898-1
 allows it in.
 
+Classic CAN and CAN FD are one mode in `MbInterfaces.c`: `MB_IF_CAN` enables
+the transceiver, and whether the FDCAN behind it runs classic or FD follows
+from what the host asks for when it opens the channel (`GS_CAN_MODE_FD`). The
+controller's configuration does tell them apart - `can` or `canfd` per
+interface - and go-multibus applies the difference on the Linux side; both
+names are mode byte 1 in `IF_SET`. See
+[go-multibus.md](go-multibus.md#can-or-can-fd), which also lists the data
+bitrates the 170 MHz FDCAN clock makes exactly.
+
 A frame from the host is echoed back when the FDCAN reports it sent, not when
 it arrives over USB. The kernel keeps at most ten frames per channel in flight
 and waits for an echo before it sends more, so that is what throttles a busy
@@ -132,7 +141,8 @@ the other into standby; no GPIO is ever re-muxed between modes.
 ## The eight combinations
 
 Interface 1 is always CAN and interface 5 is always isoSPI, so the choice is
-three independent binary ones:
+three independent binary ones. `CAN` in this table is either classic CAN or
+CAN FD; that choice changes nothing about which transceivers are live.
 
 | # | IF2   | IF3   | IF4   | CAN channels | Serial ports | isoSPI |
 |---|-------|-------|-------|--------------|--------------|--------|

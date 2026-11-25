@@ -32,6 +32,10 @@ A freshly powered module does not do anything useful on its own:
 - Once running, its interfaces default to a configuration that is almost
   certainly not what the machine needs. Interface 3 might have to be CAN where
   the default is RS485.
+- A CAN bus is classic CAN or CAN FD, and the module does not know which: it
+  switches a transceiver, and the bus type is set where the Linux network
+  interface is configured. Somebody has to decide it per bus and apply it on
+  every bring-up.
 - The controller has to know which of the three CAN channels and which of the
   three serial ports actually have a transceiver behind them, so it can bring up
   the right network interfaces and leave the others alone.
@@ -158,9 +162,9 @@ a picker, Left or Esc to come back, q or Esc to leave.
   ------------------------------------
   Module: slot 8   running
   ------------------------------------
-    Interface 1   6/5      CAN FD      fixed
+    Interface 1   6/5      CAN FD      always a CAN bus
     Interface 2   12/13    RS485
-  > Interface 3   18/19    CAN FD
+  > Interface 3   18/19    CAN
     Interface 4   24/25    RS485
     Interface 5   isoSPI   isoSPI
     isoSPI role            master
@@ -188,9 +192,12 @@ can actually be:
 
     RS485
   > CAN
+    CAN FD
     Off
   ------------------------------------
   up/down navigate   Enter apply (resets module)   left/Esc back
+
+  Between CAN and CAN FD applies without a reset. Bitrates are set with go-can.
 ```
 
 Enter applies the mode: it is written to the configuration file *and* put into
@@ -198,8 +205,14 @@ effect, the way go-can's bitrate picker saves and configures in one keypress.
 Applying implies a module reset, because the configuration travels over the
 module bus, which is only read before USB comes up. The hint line says so.
 
-Interface 1 is fixed, so its picker has a single entry and a note saying it is
-not configurable.
+**CAN and CAN FD are two entries**, and going from one to the other is the
+exception to that reset. To the module both are the same mode - the same
+transceiver, the same FDCAN - so nothing is pushed to it: only the Linux
+interface of that one bus is taken down, configured and raised again, and the
+module and its other buses carry on. See [CAN or CAN FD](#can-or-can-fd).
+
+Interface 1 is always a CAN bus, so its picker has just those two entries and
+says so.
 
 The **isoSPI role** row picks which end of the battery link the module drives.
 It applies without a reset: the module switches on the spot, and the role is
@@ -260,7 +273,8 @@ because at boot a reset is exactly what is wanted.
 
 When the module reports a different mode than the one on screen, the row says
 so: `Interface 3  18/19  CAN   module has RS485`. A configuration the module
-refused is visible immediately instead of looking like it was applied.
+refused is visible immediately instead of looking like it was applied. CAN and
+CAN FD count as the same mode there, because to the module they are.
 
 ### One-shot commands
 
@@ -274,6 +288,7 @@ cells      : 12, pack 43.464 V, spread 0.0440 V (simulated)
 
 $ go-multibus config
 $ go-multibus set 3 can
+$ go-multibus set 1 canfd
 $ go-multibus supply 9V
 $ go-multibus role slave
 $ go-multibus ports
@@ -414,12 +429,12 @@ missing file is itself a working configuration.
 | Key | Meaning |
 |-----|---------|
 | `slot` | Controller slot the module sits in, 1..8. |
-| `interfaces` | Five modes, one per connector interface. Which are allowed is in [multibus-interfaces.md](multibus-interfaces.md). |
+| `interfaces` | Five modes, one per connector interface: `can`, `canfd`, `rs485`, `rs232`, `isospi` or `off`. Which are allowed where is in [multibus-interfaces.md](multibus-interfaces.md); `can` is classic CAN and `canfd` CAN FD, see [CAN or CAN FD](#can-or-can-fd). |
 | `cell_count` | How many cells the battery side reports, 1..24. |
 | `module_poll_ms` | How often the module polls the battery over isoSPI. |
 | `publish_interval_s` | How often the service reads the module and rewrites the file. |
 | `bring_up_can` | Whether the service runs `ip link set canX up`. |
-| `can_bitrate` | Bit rate for those interfaces. |
+| `can_bitrate` | Bit rate for those interfaces, used only for a bus go-can has no configuration for. A `canfd` bus then gets a data bit rate of 2 Mbit/s. |
 | `output` | Where the cell data is published. |
 | `supply_enabled` | Whether the module's regulator is on. |
 | `supply_mv` | Its setpoint in mV, a whole number of volts from 5000 to 15000. |
@@ -583,8 +598,9 @@ one module configured its bring-up fails with
 The module always presents three gs_usb channels regardless of configuration,
 because the USB descriptor is fixed. The service only brings up the ones with a
 live transceiver: `mb_can1` is always CAN, `mb_can2` and `mb_can3` follow
-connector interfaces 3 and 4. A channel whose interface is RS485 is left down,
-since a netdev that can never carry a frame is worse than no netdev at all.
+connector interfaces 3 and 4, in either CAN mode. A channel whose interface is
+RS485 is left down, since a netdev that can never carry a frame is worse than
+no netdev at all.
 
 With several modules each service thread only looks at its own module's
 netdevs, found under its USB device, and raises them by their slot names
@@ -593,10 +609,10 @@ under the wrong name, because an interface that is up can no longer be renamed.
 
 ## Bitrates: go-can, not go-multibus
 
-`go-multibus` decides *what* an interface is - CAN or RS485 - because only the
-module can switch a transceiver. Once an interface is CAN it is an ordinary
-SocketCAN device, so its bitrate and the rest of its parameters belong to
-`go-can`, the same as for the baseboard buses:
+`go-multibus` decides *what* an interface is - CAN, CAN FD or RS485. Once an
+interface is a CAN bus it is an ordinary SocketCAN device, so its bitrates and
+the rest of its parameters belong to `go-can`, the same as for the baseboard
+buses:
 
 ```console
 # go-can list
@@ -615,6 +631,17 @@ mb_can3   yes      no       no          /etc/gocontroll/can.d/mb_can3.conf
 That split is worth keeping straight: **go-multibus owns the mode, go-can owns
 the bus parameters.** Setting a bitrate on an interface currently configured as
 RS485 will succeed and do nothing useful, because the transceiver is in standby.
+
+| Setting | Decided in | Stored in |
+|---------|------------|-----------|
+| What the interface is: `can`, `canfd`, `rs485`, `rs232`, `off` | go-multibus | `/etc/gocontroll/multibus.json`, `interfaces` |
+| Bitrate (nominal) | go-can | `/etc/gocontroll/can.d/mb_canN.conf`, `BITRATE` |
+| Data bitrate of a CAN FD bus | go-can | `/etc/gocontroll/can.d/mb_canN.conf`, `DATA_BITRATE` |
+| Sample point, listen-only, loopback, queue length | go-can | the same file |
+
+go-can's file has an `FD` line as well. For a module bus that line is a copy:
+go-multibus writes it from the mode on every bring-up, so `multibus.json` is
+the one place to change it.
 
 ### What had to change in go-can
 
@@ -640,21 +667,79 @@ The driver cannot restart a controller after bus-off, so since firmware 0.3.0
 baseboard buses get from `restart-ms 100`. The kernel still sees the bus-off and
 the restart as error frames, so `ip -details -statistics link show` counts both.
 
-### CAN FD
+### CAN or CAN FD
 
-All three module buses are CAN FD capable, and from firmware 0.3.0 on the kernel
-knows it, so the usual go-can keys apply:
+All three module buses are CAN FD capable, and from firmware 0.3.0 on the
+kernel knows it. Which of the two a bus runs is its interface mode - `can` or
+`canfd` - and from go-multibus 0.3.2 that is chosen like any other mode:
 
 ```console
+# go-multibus set 1 canfd              # or in the UI: Interface 1 -> CAN FD
+# systemctl restart go-multibus
 # go-can set mb_can1 bitrate 500000
 # go-can set mb_can1 data-bitrate 2000000
-# go-can set mb_can1 fd on
 ```
 
-Set the data bitrate before switching FD on: `fd on` without one is refused by
-the kernel. On firmware older than 0.3.0 `fd on` fails with `Operation not
-supported`. `ip -details link show` reports the error counters as
-`berr-counter tx N rx N`, read live from the module.
+The two bitrates are go-can's, as on every CAN bus: `bitrate` for the
+arbitration phase and for classic frames, `data-bitrate` for the data phase of
+an FD frame with bit rate switching. go-can's UI has a picker for each (go-can
+0.1.14); the data bitrate picker only lists what the module can make exactly.
+
+**To the module there is one CAN mode.** `can` and `canfd` both go out as mode
+byte 1 in `IF_SET`, and the module reports `can` for either. What differs is
+how the service raises the Linux interface during `enumerate`:
+
+1. go-can has a configuration for the bus: the service reads go-can's stored
+   `fd` (`go-can --json show mb_can1`). When it matches the mode it runs
+   `go-can apply mb_can1`; when it does not it runs `go-can set mb_can1 fd on`
+   or `fd off`, which stores and applies in one go.
+2. go-can has none, or is not installed: the service raises the bus itself, at
+   `can_bitrate` from `multibus.json`, with `fd on dbitrate 2000000` for
+   `canfd` and `fd off` for `can`.
+
+So the mode always wins. `go-can set mb_can1 fd on` still works and takes
+effect at once, but it lasts until the module next comes up, and go-can says so
+when it is used on a module bus.
+
+`fd off` is said explicitly in both routes. A network interface keeps CAN FD
+over a down and an up, so a bus that ran FD once stayed in FD when the word was
+simply left out - which is what go-can did up to 0.1.13.
+
+The published documents carry the configured flavour: `interfaces` reads
+`canfd` where the mode is `canfd` and the module has that interface as CAN.
+
+A configuration from before 0.3.2 has `can` everywhere, and that now means
+classic CAN. A bus that was switched to FD with `go-can set ... fd on` goes
+back to classic at the next bring-up until its mode is set to `canfd`.
+
+On firmware older than 0.3.0 a `canfd` bus does not come up: the kernel answers
+`Operation not supported`, and the service logs it and carries on with the rest.
+
+#### Data bitrates the module can make
+
+The FDCAN runs from a 170 MHz clock, and a bitrate is exact only when that
+clock divides into a whole number of time quanta per bit:
+
+| Data bitrate | 170 MHz gives | In go-can's picker |
+|--------------|---------------|--------------------|
+| 500 kbit/s   | exact         | yes                |
+| 1 Mbit/s     | exact         | yes                |
+| 2 Mbit/s     | exact         | yes, the default   |
+| 4 Mbit/s     | 42.5 quanta, 1.2 % off | no        |
+| 5 Mbit/s     | exact         | yes                |
+| 8 Mbit/s     | 21.25 quanta, 1.2 % off | no       |
+
+The kernel accepts a rate that is up to 5 % off, so `go-can set mb_can1
+data-bitrate 4000000` is not refused - but 1.2 % is more than the data phase of
+a CAN FD bus tolerates, which is why the picker leaves those out. All four
+nominal bitrates go-can offers (125, 250, 500 and 1000 kbit/s) are exact.
+
+Transmitter delay compensation is only switched on with a data phase prescaler
+of 1 or 2 (see [multibus-interfaces.md](multibus-interfaces.md)); the kernel
+picks prescaler 5 for 1 and 2 Mbit/s and 1 for 5 Mbit/s.
+
+`ip -details link show` reports the error counters as `berr-counter tx N rx N`,
+read live from the module.
 
 ## What it publishes
 
@@ -671,7 +756,7 @@ stands:
   "state": "running",
   "slot": 8,
   "module_running": true,
-  "interfaces": ["can", "rs485", "can", "rs485", "isospi"],
+  "interfaces": ["canfd", "rs485", "can", "rs485", "isospi"],
   "supply": {
     "enabled": true, "volts": 9.0, "millivolts": 9000,
     "min_mv": 5000, "max_mv": 15000, "step_mv": 1000, "stored": true
@@ -720,6 +805,8 @@ a dead battery link; this way it can.
 | `held` | go-modules is scanning or flashing this slot. It clears on its own when go-modules exits; a marker in `/run/gocontroll/module-busy/` whose process is gone is ignored. |
 | supply row says `not supported by this firmware` | The module runs a build older than 0.2.0. Everything else works; flash a current image to get the supply. |
 | `firmware older than 0.3.0 cannot be told apart from another module` | More than one module is configured and this one has no `IDENTITY`. Flash 0.3.0 or newer. |
+| `could not bring up mb_can1 as CAN FD` | The interface mode is `canfd` and the kernel refused it. Firmware older than 0.3.0 has no CAN FD; flash 0.3.0 or newer, or set the mode to `can`. |
+| a bus set to FD with go-can is classic again after a restart | The interface mode is `can`. Set it to `canfd` with go-multibus; the mode decides, go-can's `FD` line follows it. |
 | role row says `module has ...` | The module runs in another isoSPI role than configured. `fixed by its firmware` means an image older than 0.3.0, which cannot switch. |
 | a module keeps `mb_` or kernel names next to another module | Check `/run/gocontroll/multibus-usb-names` lists its serial (`gocontroll-cellmon list` shows it) and that the udev rule is installed. The service logs which devices it could not rename. |
 

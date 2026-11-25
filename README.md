@@ -102,20 +102,30 @@ uneven slot.
 
 | Interface | Pins  | Modes           | Linux                          |
 |-----------|-------|-----------------|--------------------------------|
-| 1         | 6/5   | CAN FD, fixed   | `mb_can1`                      |
+| 1         | 6/5   | CAN or CAN FD   | `mb_can1`                      |
 | 2         | 12/13 | RS485 or RS232  | `/dev/mb_serial1`              |
-| 3         | 18/19 | RS485 or CAN FD | `mb_can2` / `/dev/mb_serial2`  |
-| 4         | 24/25 | RS485 or CAN FD | `mb_can3` / `/dev/mb_serial3`  |
+| 3         | 18/19 | RS485, CAN or CAN FD | `mb_can2` / `/dev/mb_serial2`  |
+| 4         | 24/25 | RS485, CAN or CAN FD | `mb_can3` / `/dev/mb_serial3`  |
 | 5         | -     | isoSPI, fixed   | `/dev/mb_protocol`             |
 
 At most three CAN channels and at most three serial ports can be live at once.
 `mb_can2` and `/dev/mb_serial2` are the same connector pins in different modes;
 only one of each pair carries traffic.
 
-Bus parameters - bitrate, sample point, FD - belong to `go-can`, the same as for
-the baseboard buses. **go-multibus owns the mode, go-can owns the parameters.**
-The service raises each interface with `go-can apply`, so the two never disagree
-about what a bus is running at.
+Classic CAN and CAN FD are two modes, `can` and `canfd`:
+
+```console
+# go-multibus set 1 canfd                  # or pick CAN FD in the UI
+# go-can set mb_can1 bitrate 500000        # nominal bitrate
+# go-can set mb_can1 data-bitrate 2000000  # data bitrate, CAN FD only
+```
+
+Bus parameters - the bitrate, the data bitrate of a CAN FD bus, the sample
+point - belong to `go-can`, the same as for the baseboard buses. **go-multibus
+owns the mode, go-can owns the parameters.** The service raises each interface
+through go-can and tells it whether the bus is classic or FD, so the two never
+disagree about what a bus is running at. CAN FD needs module firmware 0.3.0 or
+later; see [docs/go-multibus.md](docs/go-multibus.md#can-or-can-fd).
 
 ## The external supply
 
