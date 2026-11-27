@@ -20,34 +20,35 @@
 # mb_can2 and mb_serial2 are the same connector pins in different modes, as are
 # mb_can3 and mb_serial3. Only one of each pair can be live at a time.
 #
-# More than one module: every name then carries the module's slot, so the
-# module in slot 7 gets mb7_can1..3, /dev/mb7_serial1..3 and /dev/mb7_protocol,
-# and the one in slot 8 the same with mb8_. Plain mb_ names would collide - the
-# second module would keep its kernel names. Nothing in a uevent says which slot
-# a device sits in, so the prefix comes from a map go-multibus writes once it has
+# More than one module: the numbering carries on. The module numbered 1 in
+# /etc/gocontroll/multibus.json gets the names above, the one numbered 2 gets
+# mb_can4..6, /dev/mb_serial4..6 and /dev/mb_protocol2, and so on - the names
+# the Simulink blockset offers. Nothing in a uevent says which module a device
+# belongs to, so the number comes from a map go-multibus writes once it has
 # asked each module for its USB serial number over the module bus:
 #
-#   /run/gocontroll/multibus-usb-names     206435A63245 mb7_
+#   /run/gocontroll/multibus-usb-names     206435A63245 2 7   (serial, number, slot)
 #   /var/lib/go-multibus/usb-names         the same, kept over a reboot
 #
-# The helper looks the device's serial number up there and prints the prefix;
-# with no map at all - one module configured - it prints mb_, so a controller
-# with one module is named exactly as it always was. See the helper for the
-# details, including why it waits a moment for a serial the map does not have
-# yet.
+# The helper looks the device's serial number up there and prints the name;
+# with no map at all - one module configured - it uses module 1, so a
+# controller with one module is named exactly as it always was. See the helper
+# for the details, including why it waits a moment for a serial the map does
+# not have yet.
 #
 # Runs at 81, after 80-can-usb.rules, so it has the last word on the name.
 
 # --- CAN interfaces -----------------------------------------------------------
-# The helper works out which channel this netdev is, finds the module's prefix,
+# The helper works out which channel this netdev is, finds the module's number,
 # and prints the whole name.
 SUBSYSTEM=="net", ACTION=="add", SUBSYSTEMS=="usb", \
     ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", \
     PROGRAM="/lib/udev/gocontroll-multibus-canname %k", NAME="%c"
 
-# --- Serial ports -------------------------------------------------------------
+# --- Serial ports and the protocol port ---------------------------------------
 # The USB interface number is fixed by the firmware descriptor, so it maps
-# straight onto the connector interface. Symlinks rather than renames: the
+# straight onto the connector interface: 01, 03 and 05 are RS485 1..3 (01 is
+# also RS232), 07 is the module protocol. Symlinks rather than renames: the
 # ttyACM node keeps its kernel name and cdc_acm stays happy.
 #
 # Matching is on ENV and not on ATTRS. udev requires every ATTRS in one rule to
@@ -58,26 +59,11 @@ SUBSYSTEM=="net", ACTION=="add", SUBSYSTEMS=="usb", \
 # combined freely. ID_SERIAL_SHORT is among them: it is the USB serial number,
 # the same string the map is keyed on.
 #
-# The helper prints only the prefix here (mb_ or mb7_), and %c puts it in front
-# of the rest of the name. The interface number is matched before PROGRAM, so
-# the helper runs once per port, not four times.
+# The helper prints the whole name - mb_serial4, mb_protocol2 - because with a
+# second module the bus number depends on the module, not only on the port.
+# The interface number is matched before PROGRAM, so the helper runs once per
+# port and never for a data interface.
 SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
-    ENV{ID_USB_INTERFACE_NUM}=="01", \
-    PROGRAM="/lib/udev/gocontroll-multibus-canname --prefix $env{ID_SERIAL_SHORT}", \
-    SYMLINK+="%cserial1"
-SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
-    ENV{ID_USB_INTERFACE_NUM}=="03", \
-    PROGRAM="/lib/udev/gocontroll-multibus-canname --prefix $env{ID_SERIAL_SHORT}", \
-    SYMLINK+="%cserial2"
-SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
-    ENV{ID_USB_INTERFACE_NUM}=="05", \
-    PROGRAM="/lib/udev/gocontroll-multibus-canname --prefix $env{ID_SERIAL_SHORT}", \
-    SYMLINK+="%cserial3"
-
-# Interface 7 is the module protocol, not a serial bridge. /dev/mb_protocol -
-# /dev/mb7_protocol with several modules - is what the service and the tooling
-# open.
-SUBSYSTEM=="tty", ACTION=="add", ENV{ID_VENDOR_ID}=="1d50", ENV{ID_MODEL_ID}=="606f", \
-    ENV{ID_USB_INTERFACE_NUM}=="07", \
-    PROGRAM="/lib/udev/gocontroll-multibus-canname --prefix $env{ID_SERIAL_SHORT}", \
-    SYMLINK+="%cprotocol"
+    ENV{ID_USB_INTERFACE_NUM}=="01|03|05|07", \
+    PROGRAM="/lib/udev/gocontroll-multibus-canname --tty $env{ID_SERIAL_SHORT} $env{ID_USB_INTERFACE_NUM}", \
+    SYMLINK+="%c"

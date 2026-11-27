@@ -24,14 +24,17 @@
 //!
 //! ```json
 //! { "publish_interval_s": 0.5,
-//!   "modules": [ { "slot": 7, "isospi_role": "slave" }, { "slot": 8 } ] }
+//!   "modules": [ { "slot": 8, "number": 1 }, { "slot": 7, "number": 2, "isospi_role": "slave" } ] }
 //! ```
 //!
 //! What decides the behaviour is how many modules there are, not which form
 //! the file is in. With one module - either form - everything is named and
 //! published exactly as before 0.3.0: `mb_can1`, `/dev/mb_protocol`,
-//! `multibus-cells.json`. With two or more, every name and every published
-//! document carries the slot, because otherwise they would collide.
+//! `multibus-cells.json`. With two or more, every module's device names follow
+//! its `number` - module 1 `mb_can1..3`, module 2 `mb_can4..6` - and every
+//! published document carries the slot, because otherwise they would collide.
+//! The number is kept when a module is added, so the module that was there
+//! first keeps its names.
 //!
 //! A file is written back in the form it was read in, so a one-module file
 //! that only had an interface changed comes back byte for byte as 0.2.0 would
@@ -43,7 +46,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::discover::Names;
+use crate::discover::{Names, MAX_MODULE_NUMBER};
 use crate::error::{Error, Result};
 use crate::modulebus::SLOT_SPIDEV;
 use crate::proto::{Mode, Role, INTERFACES};
@@ -112,6 +115,14 @@ pub struct ModuleConfig {
     /// without: it is what the entry is about.
     pub slot: u8,
 
+    /// Which Multibus Module this is on the controller, 1..8, and with that
+    /// its device names: module 1 has `mb_can1..3`, `/dev/mb_serial1..3` and
+    /// `/dev/mb_protocol`, module 2 `mb_can4..6`, `/dev/mb_serial4..6` and
+    /// `/dev/mb_protocol2`. `None` in a one-module file, which is module 1; a
+    /// module list entry without it gets the lowest number still free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u8>,
+
     /// The isoSPI role pushed on every bring-up. `None` only happens in a
     /// one-module file that never set it, and means what it meant before
     /// 0.3.0: leave the module in whatever role its firmware starts in. A
@@ -157,6 +168,7 @@ impl ModuleConfig {
     pub fn new(slot: u8) -> ModuleConfig {
         ModuleConfig {
             slot,
+            number: None,
             isospi_role: Some(Role::Master),
             interfaces: default_interfaces(),
             cell_count: default_cell_count(),
@@ -167,6 +179,11 @@ impl ModuleConfig {
             supply_mv: default_supply_mv(),
             output: None,
         }
+    }
+
+    /// The module number, 1 when the file does not give one.
+    pub fn number(&self) -> u8 {
+        self.number.unwrap_or(1)
     }
 
     /// The configuration as the modes the module expects.
@@ -328,6 +345,7 @@ impl Config {
             publish_interval_s: file.publish_interval_s,
             modules: vec![ModuleConfig {
                 slot: file.slot,
+                number: None,
                 isospi_role: file.isospi_role,
                 interfaces: file.interfaces,
                 cell_count: file.cell_count,
@@ -354,6 +372,14 @@ impl Config {
             // them one, so the list form always pushes a role.
             for module in &mut modules {
                 module.isospi_role.get_or_insert(Role::Master);
+            }
+            // An entry without a number - a file from before 0.3.3, or one
+            // written by hand - gets the lowest one still free, in file order.
+            for index in 0..modules.len() {
+                if modules[index].number.is_none() {
+                    let taken: Vec<u8> = modules.iter().filter_map(|module| module.number).collect();
+                    modules[index].number = free_number(&taken);
+                }
             }
             Config {
                 publish_interval_s: file.publish_interval_s,
@@ -454,6 +480,7 @@ impl Config {
         }
 
         let mut seen: Vec<u8> = Vec::new();
+        let mut numbers: Vec<u8> = Vec::new();
         for module in &self.modules {
             check_slot(module.slot)?;
             if seen.contains(&module.slot) {
@@ -463,6 +490,22 @@ impl Config {
                 )));
             }
             seen.push(module.slot);
+
+            // Two modules with one number would claim the same device names.
+            let number = module.number();
+            if !(1..=MAX_MODULE_NUMBER).contains(&number) {
+                return Err(Error::user(format!(
+                    "slot {} has number {number}; module numbers are 1..{MAX_MODULE_NUMBER}",
+                    module.slot
+                )));
+            }
+            if numbers.contains(&number) {
+                return Err(Error::user(format!(
+                    "module number {number} is given twice; every module needs its own, \
+                     because the number decides its device names"
+                )));
+            }
+            numbers.push(number);
         }
 
         // Two modules publishing to one file would overwrite each other twice
@@ -548,12 +591,22 @@ impl Config {
             return Err(Error::user(format!("slot {slot} is already configured")));
         }
 
+        let taken: Vec<u8> = self.modules.iter().map(ModuleConfig::number).collect();
+        let Some(number) = free_number(&taken) else {
+            return Err(Error::user(format!(
+                "every module number 1..{MAX_MODULE_NUMBER} is taken; remove a module first"
+            )));
+        };
+
         let mut notes = Vec::new();
 
         if self.form == Form::Single {
             self.form = Form::List;
             notes.push("the file now holds a module list".to_string());
             for module in &mut self.modules {
+                // Module 1 is what one module always was; written down so it
+                // stays module 1 whatever is added after it.
+                module.number.get_or_insert(1);
                 // The list form always pushes a role; say so, because on a
                 // hardware v1 module the firmware's own default is slave.
                 if module.isospi_role.is_none() {
@@ -573,21 +626,30 @@ impl Config {
         }
 
         let was_multi = self.is_multi();
-        self.modules.push(ModuleConfig::new(slot));
+        let mut added = ModuleConfig::new(slot);
+        added.number = Some(number);
+        self.modules.push(added);
         self.modules.sort_by_key(|module| module.slot);
 
+        // The modules that were there keep their names; only where their cell
+        // data goes changes, when the second one arrives.
         if !was_multi {
-            for module in &self.modules {
-                let names = Names::for_slot(module.slot);
+            for module in self.modules.iter().filter(|module| module.slot != slot) {
                 notes.push(format!(
-                    "slot {} is now named {}..3, {}..3 and {}, and publishes to {}",
+                    "slot {} stays module {} with {}; its cell data now goes to {}",
                     module.slot,
-                    names.can(0),
-                    names.serial(1),
-                    names.protocol(),
+                    module.number(),
+                    self.setup(module).names().summary(),
                     self.setup(module).output()
                 ));
             }
+        }
+        if let Some(module) = self.module(slot) {
+            notes.push(format!(
+                "slot {slot} is module {number}: {}, publishing to {}",
+                self.setup(module).names().summary(),
+                self.setup(module).output()
+            ));
         }
 
         self.validate()?;
@@ -607,20 +669,31 @@ impl Config {
 
         let mut notes = Vec::new();
         if !self.is_multi() {
+            // One module is named as one module always was, whatever number
+            // it had; written down, so a module added later becomes module 2.
+            let was = self.modules[0].number();
+            self.modules[0].number = Some(1);
             let module = &self.modules[0];
-            let names = Names::legacy();
+            let names = Names::first();
+            let renamed = if was == 1 {
+                String::new()
+            } else {
+                format!(" (was module {was})")
+            };
             notes.push(format!(
-                "one module is left, so slot {} goes back to {}..3, {}..3 and {}, and publishes \
-                 to {}",
+                "one module is left, so slot {} is module 1{renamed}: {}, publishing to {}",
                 module.slot,
-                names.can(0),
-                names.serial(1),
-                names.protocol(),
+                names.summary(),
                 self.setup(module).output()
             ));
         }
         Ok(notes)
     }
+}
+
+/// The lowest module number not in `taken`.
+fn free_number(taken: &[u8]) -> Option<u8> {
+    (1..=MAX_MODULE_NUMBER).find(|number| !taken.contains(number))
 }
 
 fn check_slot(slot: u8) -> Result<()> {
@@ -673,11 +746,13 @@ impl ModuleSetup {
         }
     }
 
+    /// The device names. One module is module 1 whatever its file says, so it
+    /// is named as it always was.
     pub fn names(&self) -> Names {
         if self.multi {
-            Names::for_slot(self.module.slot)
+            Names::for_module(self.module.number())
         } else {
-            Names::legacy()
+            Names::first()
         }
     }
 }
@@ -766,7 +841,7 @@ mod tests {
         assert!(!setup.multi);
         assert_eq!(setup.output(), OUTPUT_PATH);
         assert_eq!(setup.state_path(), STATE_PATH);
-        assert_eq!(setup.names(), Names::legacy());
+        assert_eq!(setup.names(), Names::first());
         // A one-module file that never set a role leaves the module alone.
         assert_eq!(setup.module.isospi_role, None);
     }
@@ -808,12 +883,16 @@ mod tests {
     }
 
     #[test]
-    fn several_modules_get_names_and_documents_per_slot() {
+    fn several_modules_get_names_by_number_and_documents_per_slot() {
         let config = Config::parse(TWO_MODULES).unwrap();
         let setups = config.setups();
         assert!(setups.iter().all(|setup| setup.multi));
-        assert_eq!(setups[0].names().can(0), "mb7_can1");
-        assert_eq!(setups[1].names().protocol(), "/dev/mb8_protocol");
+        // No numbers in the file: handed out in file order.
+        assert_eq!(config.module(7).unwrap().number, Some(1));
+        assert_eq!(config.module(8).unwrap().number, Some(2));
+        assert_eq!(setups[0].names().can(0), "mb_can1");
+        assert_eq!(setups[1].names().can(0), "mb_can4");
+        assert_eq!(setups[1].names().protocol(), "/dev/mb_protocol2");
         assert_eq!(
             setups[0].output(),
             "/dev/shm/gocontroll/multibus-slot7-cells.json"
@@ -830,7 +909,7 @@ mod tests {
         assert_eq!(config.form, Form::List);
         assert!(!config.is_multi());
         let setup = &config.setups()[0];
-        assert_eq!(setup.names(), Names::legacy());
+        assert_eq!(setup.names(), Names::first());
         assert_eq!(setup.output(), OUTPUT_PATH);
         assert_eq!(setup.state_path(), STATE_PATH);
         assert_eq!(config.publish_interval_s, 0.5);
@@ -914,13 +993,69 @@ mod tests {
     }
 
     #[test]
+    fn the_module_that_was_there_keeps_its_names_when_one_is_added() {
+        // Slot 8 first, then a module in the lower slot 7: slot 8 stays
+        // module 1, so an application built for it still finds mb_can1..3.
+        let mut config = Config::default();
+        config.add_module(7).unwrap();
+        assert_eq!(config.module(8).unwrap().number, Some(1));
+        assert_eq!(config.module(7).unwrap().number, Some(2));
+
+        let names = |config: &Config, slot: u8| config.setup(config.module(slot).unwrap()).names();
+        assert_eq!(names(&config, 8).can(0), "mb_can1");
+        assert_eq!(names(&config, 8).protocol(), "/dev/mb_protocol");
+        assert_eq!(names(&config, 7).can(0), "mb_can4");
+        assert_eq!(names(&config, 7).serial(3), "/dev/mb_serial6");
+        assert_eq!(names(&config, 7).protocol(), "/dev/mb_protocol2");
+
+        // The numbers are in the file, so they survive a reload.
+        let reread = Config::parse(&config.to_text().unwrap()).unwrap();
+        assert_eq!(reread.module(8).unwrap().number, Some(1));
+        assert_eq!(reread.module(7).unwrap().number, Some(2));
+
+        // A third takes the next number, and the others keep theirs.
+        config.add_module(5).unwrap();
+        assert_eq!(config.module(5).unwrap().number, Some(3));
+        assert_eq!(names(&config, 5).can(2), "mb_can9");
+        assert_eq!(config.module(8).unwrap().number, Some(1));
+    }
+
+    #[test]
+    fn a_number_given_up_is_handed_out_again() {
+        let mut config = Config::default();
+        config.add_module(7).unwrap();
+        config.add_module(5).unwrap();
+        config.remove_module(7).unwrap();
+        config.add_module(6).unwrap();
+        assert_eq!(config.module(6).unwrap().number, Some(2));
+        assert_eq!(config.module(5).unwrap().number, Some(3));
+    }
+
+    #[test]
+    fn two_modules_cannot_share_a_number() {
+        let text = r#"{ "modules": [ { "slot": 7, "number": 2 }, { "slot": 8, "number": 2 } ] }"#;
+        let failure = Config::parse(text).unwrap_err();
+        assert!(failure.to_string().contains("module number 2 is given twice"));
+
+        let text = r#"{ "modules": [ { "slot": 7, "number": 9 }, { "slot": 8 } ] }"#;
+        assert!(Config::parse(text).is_err());
+
+        // A number left out goes around the ones that are given.
+        let text = r#"{ "modules": [ { "slot": 7 }, { "slot": 8, "number": 1 } ] }"#;
+        let config = Config::parse(text).unwrap();
+        assert_eq!(config.module(7).unwrap().number, Some(2));
+    }
+
+    #[test]
     fn removing_down_to_one_leaves_a_one_entry_list() {
         let mut config = Config::parse(TWO_MODULES).unwrap();
         config.remove_module(7).unwrap();
         assert_eq!(config.form, Form::List);
         assert_eq!(config.slots(), vec![8]);
         assert!(!config.is_multi());
-        assert_eq!(config.setups()[0].names(), Names::legacy());
+        assert_eq!(config.setups()[0].names(), Names::first());
+        // Slot 8 was module 2; alone it is module 1 again.
+        assert_eq!(config.module(8).unwrap().number, Some(1));
 
         assert!(config.remove_module(8).is_err(), "the last one stays");
         assert!(config.remove_module(5).is_err(), "never configured");

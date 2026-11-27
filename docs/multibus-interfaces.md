@@ -83,8 +83,9 @@ The kernel would otherwise name these in discovery order, which differs per
 controller - `can4`..`can6` on a Moduline IV with four onboard mcp251x
 controllers, `can2`..`can4` on an M1 with two. `81-gocontroll-multibus.rules`
 pins them to the names above; see [go-multibus.md](go-multibus.md#device-names).
-With more than one module the names carry the slot - `mb7_can1` is CAN 1 of the
-module in slot 7 - because two modules would otherwise both claim `mb_can1`.
+With more than one module the numbering carries on - `mb_can4..6` are CAN 1..3
+of the module numbered 2 in the configuration - because two modules would
+otherwise both claim `mb_can1`.
 
 Every interrupt callback in `usbd_gs_usb.c` turns the peripheral back into a
 channel with `gs_channel_of()`, the reverse of `gs_get_fdcan()`, so the two

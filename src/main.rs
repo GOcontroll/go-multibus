@@ -172,18 +172,18 @@ fn daemon(config_path: &str) -> Result<()> {
     // The name map has to be right before the first module is reset, because
     // udev reads it the moment a module enumerates.
     if multi {
-        let prefixes: Vec<String> = config
+        let numbers: Vec<u8> = config
             .setups()
             .iter()
-            .map(|setup| setup.names().prefix().to_string())
+            .map(|setup| setup.names().number())
             .collect();
-        if let Err(failure) = namemap::prepare(&prefixes) {
+        if let Err(failure) = namemap::prepare(&numbers) {
             eprintln!("{failure}");
         }
     } else {
         // One module is named the way it always was, which is what udev does
         // when there is no map. A map left from a configuration that used to
-        // have more modules would give it the slot names instead.
+        // have more modules could give it another module's names instead.
         match namemap::clear() {
             Ok(true) => eprintln!(
                 "one module configured: removed the name map left by a configuration with more"

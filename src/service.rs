@@ -606,11 +606,12 @@ impl Supervisor {
     fn adopt_serial(&mut self, serial: String) {
         if self.usb_serial.as_deref() != Some(serial.as_str()) {
             self.log(format!(
-                "USB serial {serial}, named {}*",
-                self.names.prefix()
+                "USB serial {serial}, module {}: {}",
+                self.names.number(),
+                self.names.summary()
             ));
         }
-        if let Err(failure) = namemap::record(&serial, self.names.prefix()) {
+        if let Err(failure) = namemap::record(&serial, self.names.number(), self.config.slot) {
             // Not fatal: the module works without its names, it just gets the
             // wrong ones. The name check after enumeration says so as well.
             self.log(failure.to_string());
@@ -642,16 +643,16 @@ impl Supervisor {
             }
         }
 
-        if let Some(serial) = namemap::serial_for_prefix(self.names.prefix()) {
+        if let Some(serial) = namemap::serial_for_number(self.names.number()) {
             self.usb_serial = Some(serial.clone());
             return Ok(serial);
         }
 
         Err(Error::module(format!(
             "cannot tell which USB device is slot {}'s: the module bus does not answer \
-             and the name map has no entry for {}. Resetting the module asks it again.",
+             and the name map has no entry for module {}. Resetting the module asks it again.",
             self.config.slot,
-            self.names.prefix()
+            self.names.number()
         )))
     }
 

@@ -1,15 +1,16 @@
 #!/bin/sh
-# Print the deterministic name for one Multibus gs_usb CAN interface, or the
-# name prefix for one Multibus module.
+# Print the deterministic name of one Multibus device.
 #
-#   gocontroll-multibus-canname <netdev>            mb_can2, or mb7_can2
-#   gocontroll-multibus-canname --prefix <serial>   mb_, or mb7_
+#   gocontroll-multibus-canname <netdev>                  mb_can2, or mb_can5
+#   gocontroll-multibus-canname --tty <serial> <usb if>   mb_serial1, mb_serial4,
+#                                                         mb_protocol, mb_protocol2
+#   gocontroll-multibus-canname --number <serial>         1, or 2
 #
 # Called from 81-gocontroll-multibus.rules: the first form for every netdev the
 # module adds, with its kernel name; the second for every tty, with the USB
-# serial number udev already knows, so the tty rules can put the same prefix
-# on their symlinks. Prints the name and nothing else, because udev takes the
-# whole of stdout as the result.
+# serial number and interface number udev already knows. Prints the name and
+# nothing else, because udev takes the whole of stdout as the result. The third
+# form is for a person checking what a module would be named.
 #
 # Why this is needed: the kernel numbers CAN interfaces in the order it finds
 # them, and how many it has already found depends on the controller. A Moduline
@@ -30,28 +31,32 @@
 #
 # --- More than one module -----------------------------------------------------
 #
-# Two modules would both claim mb_can1, and the second would keep its kernel
-# name. So with more than one module configured every name carries the slot
-# instead: mb7_can1, /dev/mb7_serial1, /dev/mb7_protocol. Nothing in a uevent
-# says which slot a device is in - both modules have the same ids and the same
-# interfaces - but go-multibus asks every module for its USB serial number over
-# the module bus, which does reach one particular slot, and writes down what it
-# learned, one module per line:
+# Every module on a controller has a number, and the numbering carries on from
+# one module to the next: module 1 is mb_can1..3, /dev/mb_serial1..3 and
+# /dev/mb_protocol - what a single module has always been called - and module 2
+# is mb_can4..6, /dev/mb_serial4..6 and /dev/mb_protocol2. Those are the names
+# the Simulink blockset offers.
 #
-#   206435A63245 mb7_
+# Which module has which number is in /etc/gocontroll/multibus.json. Nothing in
+# a uevent says which module a device belongs to - both have the same ids and
+# the same interfaces - but go-multibus asks every module for its USB serial
+# number over the module bus, which does reach one particular slot, and writes
+# down what it learned, one module per line: serial, module number, slot.
+#
+#   206435A63245 2 7
 #
 # in /run/gocontroll/multibus-usb-names, with a copy that survives a reboot in
 # /var/lib/go-multibus/usb-names. This looks the device's serial number up
 # there, live copy first.
 #
-# No map at all means one module, and that module gets the mb_ names it has
-# always had - so a controller with one module behaves exactly as before.
+# No map at all means one module, and that module is module 1 - so a
+# controller with one module behaves exactly as before.
 #
 # A map that does not list the serial yet means the module enumerated before
 # go-multibus got round to writing its line, which happens a few hundred
 # milliseconds after the application starts - about when USB comes up. So the
-# live map is polled for up to three seconds before falling back to mb_. Should
-# the fallback still be taken, go-multibus notices the wrong names after
+# live map is polled for up to three seconds before falling back to module 1.
+# Should the fallback still be taken, go-multibus notices the wrong names after
 # enumeration and has udev name those devices again.
 #
 # --- Channel order ------------------------------------------------------------
@@ -74,13 +79,14 @@
 
 RUN_MAP=/run/gocontroll/multibus-usb-names
 STORE_MAP=/var/lib/go-multibus/usb-names
-SINGLE_PREFIX=mb_
+MAX_NUMBER=8
 
-# Print the prefix one map file gives a serial number, or nothing.
+# Print the module number one map file gives a serial number, or nothing.
 #
-# Only letters, digits and underscores are accepted, because the result ends up
-# in a network interface name and in a /dev symlink; anything else in the file
-# is treated as if the line were not there.
+# Only 1..MAX_NUMBER is accepted, because the result ends up in a network
+# interface name and in a /dev symlink; anything else in the file - including a
+# name prefix such as mb7_ from before the numbers - is treated as if the line
+# were not there.
 lookup() {
     [ -r "$2" ] || return 0
     # The second test keeps a last line without a newline, as an editor may
@@ -88,16 +94,17 @@ lookup() {
     while read -r key value rest || [ -n "$key" ]; do
         [ "$key" = "$1" ] || continue
         case "$value" in
-            ""|*[!A-Za-z0-9_]*) return 0 ;;
+            ""|*[!0-9]*) return 0 ;;
         esac
+        [ "$value" -ge 1 ] && [ "$value" -le "$MAX_NUMBER" ] || return 0
         printf '%s\n' "$value"
         return 0
     done < "$2"
 }
 
-# Print the prefix for a module, waiting for the map to catch up when there is
+# Print the number of a module, waiting for the map to catch up when there is
 # a map that does not know it yet.
-prefix_for() {
+number_for() {
     serial="$1"
     if [ -n "$serial" ]; then
         tries=0
@@ -119,11 +126,33 @@ prefix_for() {
             sleep 0.1
         done
     fi
-    printf '%s\n' "$SINGLE_PREFIX"
+    printf '1\n'
 }
 
-if [ "$1" = "--prefix" ]; then
-    prefix_for "$2"
+if [ "$1" = "--number" ]; then
+    number_for "$2"
+    exit 0
+fi
+
+if [ "$1" = "--tty" ]; then
+    number=$(number_for "$2")
+    offset=$((3 * (number - 1)))
+    # The USB interface number as udev has it, two hex digits. Fixed by the
+    # firmware descriptor: 01, 03 and 05 bridge connector interfaces 2, 3 and
+    # 4 (RS485 1..3), 07 is the module protocol.
+    case "$3" in
+        01) printf 'mb_serial%d\n' $((offset + 1)) ;;
+        03) printf 'mb_serial%d\n' $((offset + 2)) ;;
+        05) printf 'mb_serial%d\n' $((offset + 3)) ;;
+        07)
+            if [ "$number" -eq 1 ]; then
+                printf 'mb_protocol\n'
+            else
+                printf 'mb_protocol%d\n' "$number"
+            fi
+            ;;
+        *) exit 1 ;;
+    esac
     exit 0
 fi
 
@@ -185,9 +214,9 @@ done
 # The netdev hangs off a USB interface; the serial number lives on the USB
 # device that interface belongs to, one directory up.
 serial=$(cat "${usbif%/*}/serial" 2>/dev/null)
-prefix=$(prefix_for "$serial")
+number=$(number_for "$serial")
 
 case "$channel" in
-    0|1|2) printf '%scan%d\n' "$prefix" $((channel + 1)) ;;
+    0|1|2) printf 'mb_can%d\n' $((3 * (number - 1) + channel + 1)) ;;
     *) exit 1 ;;   # more channels than this firmware has: leave the name alone
 esac

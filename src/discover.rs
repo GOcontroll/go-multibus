@@ -58,55 +58,71 @@ pub const OTG_DR_MODE_PATH: &str = "/proc/device-tree/soc@0/bus@32c00000/usb@32e
 /// Where the USB core lists every device and interface.
 const USB_DEVICES: &str = "/sys/bus/usb/devices";
 
-/// The prefix every Multibus device name starts with on a controller with one
-/// module: `mb_can1`, `/dev/mb_serial1`, `/dev/mb_protocol`.
-pub const LEGACY_PREFIX: &str = "mb_";
+/// The highest module number: one per slot of the largest controller.
+pub const MAX_MODULE_NUMBER: u8 = 8;
 
 /// The names udev gives one module's devices.
 ///
-/// One module gets the names it has always had, `mb_can1..3`,
-/// `/dev/mb_serial1..3` and `/dev/mb_protocol`. With more than one module
-/// configured those would collide, so each module's names carry its slot
-/// instead: `mb7_can1`, `/dev/mb7_serial1`, `/dev/mb7_protocol`. The longest,
-/// `mb8_can3`, is well inside the 15 characters a network interface name may
-/// have.
+/// Every Multibus module on a controller has a number, and the number decides
+/// all of its names. Module 1 has the names a single module has always had -
+/// `mb_can1..3`, `/dev/mb_serial1..3` and `/dev/mb_protocol` - and every next
+/// module carries the count on: module 2 is `mb_can4..6`, `/dev/mb_serial4..6`
+/// and `/dev/mb_protocol2`. That is what the Simulink blockset expects; a name
+/// with the slot in it, such as `mb7_can1`, it cannot choose. The longest,
+/// `mb_can24` of module 8, is well inside the 15 characters a network interface
+/// name may have.
 ///
-/// The prefix is the whole difference, which is why it is what the name map
-/// stores and what the udev helper prints.
+/// Which module has which number is in the configuration, not in the hardware:
+/// a module keeps its number when another one is added, so an application
+/// built for one module keeps finding its buses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Names {
-    prefix: String,
+    number: u8,
 }
 
 impl Names {
-    pub fn legacy() -> Names {
+    /// Module 1: the names of a controller with one module.
+    pub fn first() -> Names {
+        Names { number: 1 }
+    }
+
+    /// Module `number`, 1 based. Out of range counts as module 1.
+    pub fn for_module(number: u8) -> Names {
         Names {
-            prefix: LEGACY_PREFIX.to_string(),
+            number: if (1..=MAX_MODULE_NUMBER).contains(&number) {
+                number
+            } else {
+                1
+            },
         }
     }
 
-    pub fn for_slot(slot: u8) -> Names {
-        Names {
-            prefix: format!("mb{slot}_"),
-        }
+    pub fn number(&self) -> u8 {
+        self.number
     }
 
-    pub fn prefix(&self) -> &str {
-        &self.prefix
+    /// How many buses of each kind the modules before this one have.
+    fn offset(&self) -> usize {
+        3 * (self.number as usize - 1)
     }
 
     /// Network interface name of a gs_usb channel, 0 based.
     pub fn can(&self, channel: usize) -> String {
-        format!("{}can{}", self.prefix, channel + 1)
+        format!("mb_can{}", self.offset() + channel + 1)
     }
 
-    /// Symlink for a serial bridge, numbered 1..3 as the knowledge base does.
-    pub fn serial(&self, number: u8) -> String {
-        format!("/dev/{}serial{number}", self.prefix)
+    /// Symlink for a serial bridge; `bus` is the module's own RS485 number,
+    /// 1..3, as the knowledge base numbers them.
+    pub fn serial(&self, bus: u8) -> String {
+        format!("/dev/mb_serial{}", self.offset() + bus as usize)
     }
 
     pub fn protocol(&self) -> String {
-        format!("/dev/{}protocol", self.prefix)
+        if self.number == 1 {
+            PROTOCOL_SYMLINK.to_string()
+        } else {
+            format!("{PROTOCOL_SYMLINK}{}", self.number)
+        }
     }
 
     /// The symlink the udev rule gives the tty on a CDC control interface.
@@ -119,15 +135,19 @@ impl Names {
             _ => None,
         }
     }
-}
 
-/// The slot a name prefix stands for: `mb7_` is slot 7, the legacy `mb_` none.
-pub fn slot_of_prefix(prefix: &str) -> Option<u8> {
-    prefix
-        .strip_prefix("mb")?
-        .strip_suffix('_')?
-        .parse()
-        .ok()
+    /// All of them in one line, for messages: `mb_can4..6, /dev/mb_serial4..6
+    /// and /dev/mb_protocol2`.
+    pub fn summary(&self) -> String {
+        format!(
+            "{}..{}, {}..{} and {}",
+            self.can(0),
+            self.offset() + 3,
+            self.serial(1),
+            self.offset() + 3,
+            self.protocol()
+        )
+    }
 }
 
 /// One CDC-ACM tty that belongs to a Multibus module.
@@ -428,12 +448,12 @@ pub fn module_protocol_path(module: &UsbModule, names: &Names) -> Option<String>
     Some(if leads_here { link } else { port.device })
 }
 
-/// The names a module's devices should carry, going by the name map: the slot
-/// names when the map lists its serial number, the single-module ones when not.
+/// The names a module's devices should carry, going by the name map: those of
+/// its number when the map lists its serial number, module 1's when not.
 pub fn names_for_serial(serial: &str) -> Names {
-    crate::namemap::prefix_for_serial(serial)
-        .map(|prefix| Names { prefix })
-        .unwrap_or_else(Names::legacy)
+    crate::namemap::number_for_serial(serial)
+        .map(Names::for_module)
+        .unwrap_or_else(Names::first)
 }
 
 /// The udev symlink that leads to this port, if there is one.
@@ -469,16 +489,8 @@ pub fn protocol_port_for_serial(serial: &str) -> Result<String> {
 /// The protocol port of the module in `slot`, found through the name map the
 /// service writes once more than one module is configured.
 pub fn protocol_port_for_slot(slot: u8) -> Result<String> {
-    let names = Names::for_slot(slot);
-    if let Some(serial) = crate::namemap::serial_for_prefix(names.prefix()) {
+    if let Some(serial) = crate::namemap::serial_for_slot(slot) {
         return protocol_port_for_serial(&serial);
-    }
-
-    // No map entry, but udev may still have named it - from a map that has
-    // since been cleaned up, or by hand.
-    let link = names.protocol();
-    if Path::new(&link).exists() {
-        return Ok(link);
     }
 
     Err(Error::user(format!(
@@ -606,13 +618,88 @@ pub fn otg_dr_mode() -> Option<String> {
     }
 }
 
+/// Where go-modules writes what its last scan found in every slot.
+pub const GO_MODULES_LAYOUT: &str = "/lib/firmware/gocontroll/modules.json";
+
+/// The slots go-modules last found a Multibus module in, lowest first.
+///
+/// go-modules scans the module bus at boot and on every update, and writes
+/// down what it found. Reading that is how the UI learns about a module that is
+/// not configured yet without sending anything to a slot itself - where a
+/// module of another kind, driven by the application, could take a Multibus
+/// message the wrong way. No file, or one that does not parse, is no modules.
+pub fn multibus_slots_found() -> Vec<u8> {
+    fs::read_to_string(GO_MODULES_LAYOUT)
+        .map(|text| multibus_slots_in(&text))
+        .unwrap_or_default()
+}
+
+/// The Multibus slots in the text of go-modules' layout file. A slot counts
+/// when its module type is `multibus`, or - in a file from before go-modules
+/// wrote the type down - when its firmware is a Multibus one, `20-30-4-...`.
+pub fn multibus_slots_in(text: &str) -> Vec<u8> {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let Some(entries) = document.get("slots").and_then(|slots| slots.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut slots: Vec<u8> = entries
+        .iter()
+        .filter(|entry| match entry.get("module_type").and_then(|kind| kind.as_str()) {
+            Some(kind) => kind == "multibus",
+            None => entry
+                .get("firmware")
+                .and_then(|firmware| firmware.as_str())
+                .is_some_and(|firmware| firmware.starts_with("20-30-4-")),
+        })
+        .filter_map(|entry| entry.get("slot").and_then(|slot| slot.as_u64()))
+        .filter_map(|slot| u8::try_from(slot).ok())
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn one_module_keeps_the_names_it_always_had() {
-        let names = Names::legacy();
+    fn the_multibus_slots_are_read_from_the_go_modules_layout() {
+        let layout = r#"{
+            "schema_version": "1.0.0",
+            "controller": "moduline-l4",
+            "slots": [
+                { "slot": 8, "firmware": "20-30-4-3-0-3-0", "module_type": "multibus" },
+                { "slot": 1, "firmware": "20-10-3-3-1-1-0", "module_type": "input-4-20ma" },
+                { "slot": 2, "firmware": "" },
+                { "slot": 7, "firmware": "20-30-4-3-0-3-0", "module_type": "multibus" }
+            ]
+        }"#;
+        assert_eq!(multibus_slots_in(layout), vec![7, 8]);
+    }
+
+    #[test]
+    fn an_older_layout_without_a_module_type_goes_by_the_firmware() {
+        let layout = r#"{ "slots": [
+            { "slot": 6, "firmware": "20-30-4-2-0-3-0" },
+            { "slot": 5, "firmware": "20-20-3-5-1-0-0" }
+        ] }"#;
+        assert_eq!(multibus_slots_in(layout), vec![6]);
+    }
+
+    #[test]
+    fn an_unreadable_layout_finds_nothing() {
+        assert!(multibus_slots_in("").is_empty());
+        assert!(multibus_slots_in("{ \"slots\": 3 }").is_empty());
+        assert!(multibus_slots_in("not json").is_empty());
+    }
+
+    #[test]
+    fn module_1_keeps_the_names_one_module_always_had() {
+        let names = Names::first();
         for (channel, name) in CAN_INTERFACE_NAMES.iter().enumerate() {
             assert_eq!(names.can(channel), *name);
         }
@@ -621,32 +708,39 @@ mod tests {
         assert_eq!(names.tty_link(5).as_deref(), Some("/dev/mb_serial3"));
         assert_eq!(names.tty_link(7).as_deref(), Some(PROTOCOL_SYMLINK));
         assert_eq!(names.tty_link(2), None, "a data interface has no tty of its own");
+        assert_eq!(Names::for_module(1), names);
     }
 
     #[test]
-    fn several_modules_carry_their_slot_in_every_name() {
-        let names = Names::for_slot(7);
-        assert_eq!(names.prefix(), "mb7_");
-        assert_eq!(names.can(0), "mb7_can1");
-        assert_eq!(names.can(2), "mb7_can3");
-        assert_eq!(names.serial(2), "/dev/mb7_serial2");
-        assert_eq!(names.protocol(), "/dev/mb7_protocol");
-        assert_eq!(names.tty_link(1).as_deref(), Some("/dev/mb7_serial1"));
+    fn module_2_carries_the_count_on() {
+        let names = Names::for_module(2);
+        assert_eq!(names.can(0), "mb_can4");
+        assert_eq!(names.can(2), "mb_can6");
+        assert_eq!(names.serial(1), "/dev/mb_serial4");
+        assert_eq!(names.tty_link(5).as_deref(), Some("/dev/mb_serial6"));
+        assert_eq!(names.protocol(), "/dev/mb_protocol2");
+        assert_eq!(
+            names.summary(),
+            "mb_can4..6, /dev/mb_serial4..6 and /dev/mb_protocol2"
+        );
+        assert_eq!(
+            Names::first().summary(),
+            "mb_can1..3, /dev/mb_serial1..3 and /dev/mb_protocol"
+        );
     }
 
     #[test]
-    fn every_slot_name_fits_a_network_interface() {
+    fn every_name_fits_a_network_interface() {
         // IFNAMSIZ is 16 including the terminator.
-        for slot in 1..=8 {
-            assert!(Names::for_slot(slot).can(2).len() <= 15);
+        for number in 1..=MAX_MODULE_NUMBER {
+            assert!(Names::for_module(number).can(2).len() <= 15);
         }
+        assert_eq!(Names::for_module(MAX_MODULE_NUMBER).can(2), "mb_can24");
     }
 
     #[test]
-    fn a_prefix_gives_back_its_slot() {
-        assert_eq!(slot_of_prefix("mb7_"), Some(7));
-        assert_eq!(slot_of_prefix(Names::for_slot(3).prefix()), Some(3));
-        assert_eq!(slot_of_prefix("mb_"), None);
-        assert_eq!(slot_of_prefix("can_"), None);
+    fn a_number_out_of_range_is_module_1() {
+        assert_eq!(Names::for_module(0), Names::first());
+        assert_eq!(Names::for_module(MAX_MODULE_NUMBER + 1), Names::first());
     }
 }

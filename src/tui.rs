@@ -13,6 +13,12 @@
 //! With more than one module configured there is one supervisor per module,
 //! all of them looked after on every idle tick, and Tab moves the screen from
 //! one to the next. The header says which module the list is about.
+//!
+//! The header is also the first row of the list. Enter on it opens the module
+//! picker: every module in the configuration, plus every Multibus module
+//! go-modules found in a slot that is not configured yet - so a second module
+//! shows up in the UI as soon as it is plugged in and scanned, and Enter on it
+//! adds it to the configuration.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -28,8 +34,10 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 
-use crate::config::{store_module, Config, CONFIG_PATH};
+use crate::config::{store_module, Config, ModuleSetup, CONFIG_PATH};
+use crate::discover;
 use crate::error::{Error, Result};
+use crate::namemap;
 use crate::proto::{format_volts, Mode, Role, Supply, INTERFACES};
 use crate::service::{State, Supervisor};
 
@@ -51,16 +59,19 @@ const LOG_SHOWN: usize = 6;
 /// idle UI costs nothing.
 const TICK: Duration = Duration::from_millis(200);
 
-/// The rows of the main list: the five connector interfaces, the isoSPI role
-/// right under interface 5 it belongs to, then the supply.
-#[derive(Copy, Clone, PartialEq, Eq)]
+/// The rows of the main list: the module the list is about, the five
+/// connector interfaces, the isoSPI role right under interface 5 it belongs
+/// to, then the supply. The module row is drawn as the header.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Row {
+    Module,
     Interface(usize),
     Role,
     Supply,
 }
 
-const ROWS: [Row; 7] = [
+const ROWS: [Row; 8] = [
+    Row::Module,
     Row::Interface(0),
     Row::Interface(1),
     Row::Interface(2),
@@ -92,6 +103,16 @@ enum View {
         cursor: usize,
         error: Option<String>,
     },
+    PickModule {
+        cursor: usize,
+        error: Option<String>,
+    },
+    /// What adding the module in `slot` changes, before anything is written.
+    ConfirmAdd {
+        slot: u8,
+        notes: Vec<String>,
+        error: Option<String>,
+    },
     Cells,
 }
 
@@ -108,6 +129,190 @@ type Log = Rc<RefCell<VecDeque<String>>>;
 struct Attached {
     supervisor: Supervisor,
     log: Log,
+}
+
+fn new_log() -> Log {
+    Rc::new(RefCell::new(VecDeque::new()))
+}
+
+fn push_log(log: &Log, message: &str) {
+    let mut lines = log.borrow_mut();
+    lines.push_back(message.to_string());
+    while lines.len() > LOG_KEPT {
+        lines.pop_front();
+    }
+}
+
+/// A supervisor for `setup` that writes into `log`.
+fn attach(setup: ModuleSetup, log: Log) -> Attached {
+    let sink = {
+        let log = Rc::clone(&log);
+        Box::new(move |message: &str| push_log(&log, message))
+    };
+    Attached {
+        supervisor: Supervisor::attached(setup, sink),
+        log,
+    }
+}
+
+/// One line of the module picker: a slot, and where its supervisor is when the
+/// module is configured.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct ModuleEntry {
+    slot: u8,
+    configured: Option<usize>,
+}
+
+/// The configured modules and the ones go-modules found, once each, in slot
+/// order.
+fn module_entries(configured: &[u8], found: &[u8]) -> Vec<ModuleEntry> {
+    let mut slots: Vec<u8> = configured.iter().chain(found).copied().collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+        .into_iter()
+        .map(|slot| ModuleEntry {
+            slot,
+            configured: configured.iter().position(|candidate| *candidate == slot),
+        })
+        .collect()
+}
+
+/// Everything the UI holds across key presses.
+struct Ui {
+    modules: Vec<Attached>,
+    /// The module the screen is about, as an index into `modules`.
+    selected: usize,
+    /// Slots go-modules last found a Multibus module in, configured or not.
+    found: Vec<u8>,
+    config_path: String,
+}
+
+impl Ui {
+    fn current(&self) -> &Attached {
+        &self.modules[self.selected]
+    }
+
+    fn configured_slots(&self) -> Vec<u8> {
+        self.modules
+            .iter()
+            .map(|module| module.supervisor.slot())
+            .collect()
+    }
+
+    fn entries(&self) -> Vec<ModuleEntry> {
+        module_entries(&self.configured_slots(), &self.found)
+    }
+
+    /// Slots with a Multibus module in them that the configuration lacks.
+    fn unconfigured(&self) -> Vec<u8> {
+        self.entries()
+            .iter()
+            .filter(|entry| entry.configured.is_none())
+            .map(|entry| entry.slot)
+            .collect()
+    }
+
+    /// The module picker, on the module the screen is about. go-modules may
+    /// have scanned since the UI started, so what it found is read again.
+    fn open_module_picker(&mut self) -> View {
+        self.found = discover::multibus_slots_found();
+        let here = self.current().supervisor.slot();
+        let cursor = self
+            .entries()
+            .iter()
+            .position(|entry| entry.slot == here)
+            .unwrap_or(0);
+        View::PickModule {
+            cursor,
+            error: None,
+        }
+    }
+
+    /// Add the module in `slot` to the configuration and bring it up.
+    ///
+    /// The modules that are there keep their number and so their names - the
+    /// first one stays `mb_can1..3` - so none of them is reset: they carry on
+    /// running. Only the new module is reset and goes through the whole
+    /// bring-up, which is what tells it its interfaces and gets its devices
+    /// named as the next module.
+    fn add_module(&mut self, slot: u8) -> Result<()> {
+        let mut config = Config::load(&self.config_path)?;
+        let was_multi = config.is_multi();
+        let notes = config.add_module(slot)?;
+        config.save(&self.config_path)?;
+
+        // With more than one module the name map has to be ready before the
+        // new one is reset, because udev reads it the moment a module
+        // enumerates.
+        let numbers: Vec<u8> = config
+            .setups()
+            .iter()
+            .map(|setup| setup.names().number())
+            .collect();
+        let map_failure = namemap::prepare(&numbers).err();
+
+        let mut previous = std::mem::take(&mut self.modules);
+        let mut modules = Vec::new();
+        for setup in config.setups() {
+            let existing = previous
+                .iter()
+                .position(|module| module.supervisor.slot() == setup.module.slot);
+            let module = match existing {
+                // Kept as it is: nothing about it changes.
+                Some(index) if was_multi => previous.remove(index),
+                // The first module becomes one of several: same names, but
+                // from now on it is told apart from the new one by its USB
+                // serial number, which takes a supervisor that knows. It
+                // attaches without a reset, so the module keeps running; the
+                // old supervisor lets go of the protocol port first.
+                Some(index) => {
+                    previous[index].supervisor.close();
+                    attach(setup, Rc::clone(&previous[index].log))
+                }
+                None => {
+                    let mut module = attach(setup, new_log());
+                    module.supervisor.restart(true);
+                    module
+                }
+            };
+            modules.push(module);
+        }
+        self.modules = modules;
+        self.selected = self
+            .modules
+            .iter()
+            .position(|module| module.supervisor.slot() == slot)
+            .unwrap_or(0);
+
+        let log = Rc::clone(&self.current().log);
+        push_log(
+            &log,
+            &format!(
+                "slot {slot} added to {}; configured slots: {}",
+                self.config_path,
+                config
+                    .slots()
+                    .iter()
+                    .map(|slot| slot.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+        for note in notes {
+            push_log(&log, &note);
+        }
+        if let Some(failure) = map_failure {
+            push_log(&log, &failure.to_string());
+        }
+        Ok(())
+    }
+}
+
+/// What adding the module in `slot` would change, without changing anything.
+fn preview_add(config_path: &str, slot: u8) -> Result<Vec<String>> {
+    let mut config = Config::load(config_path)?;
+    config.add_module(slot)
 }
 
 /// One choice in the supply picker: off, or a setpoint the module accepts.
@@ -129,42 +334,34 @@ impl SupplyChoice {
 pub fn run(config_path: &str) -> Result<()> {
     let config = Config::load(config_path)?;
 
-    let mut modules: Vec<Attached> = config
-        .setups()
-        .into_iter()
-        .map(|setup| {
-            let log: Log = Rc::new(RefCell::new(VecDeque::new()));
-            let sink = {
-                let log = Rc::clone(&log);
-                Box::new(move |message: &str| {
-                    let mut lines = log.borrow_mut();
-                    lines.push_back(message.to_string());
-                    while lines.len() > LOG_KEPT {
-                        lines.pop_front();
-                    }
-                })
-            };
-            Attached {
-                supervisor: Supervisor::attached(setup, sink),
-                log,
-            }
-        })
-        .collect();
+    let mut ui = Ui {
+        modules: config
+            .setups()
+            .into_iter()
+            .map(|setup| attach(setup, new_log()))
+            .collect(),
+        selected: 0,
+        found: discover::multibus_slots_found(),
+        config_path: config_path.to_string(),
+    };
 
-    let mut selected = 0usize;
-    let mut view = View::List { cursor: 0 };
+    // With more than one Multibus module about, which one the list is for is
+    // the first question, so the caret starts on the module row. With one,
+    // there is nothing to choose and it starts on the first interface.
+    let first = if ui.entries().len() > 1 {
+        Row::Module
+    } else {
+        Row::Interface(0)
+    };
+    let mut view = View::List {
+        cursor: row_index(first),
+    };
     let mut stdout = io::stdout();
 
     terminal::enable_raw_mode()?;
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
-    let result = event_loop(
-        &mut stdout,
-        &mut modules,
-        &mut selected,
-        &mut view,
-        config_path,
-    );
+    let result = event_loop(&mut stdout, &mut ui, &mut view);
 
     let _ = execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show);
     let _ = terminal::disable_raw_mode();
@@ -172,18 +369,9 @@ pub fn run(config_path: &str) -> Result<()> {
     result
 }
 
-fn event_loop(
-    stdout: &mut impl Write,
-    modules: &mut [Attached],
-    selected: &mut usize,
-    view: &mut View,
-    config_path: &str,
-) -> Result<()> {
-    let several = modules.len() > 1;
-
+fn event_loop(stdout: &mut impl Write, ui: &mut Ui, view: &mut View) -> Result<()> {
     loop {
-        let shown = &modules[*selected];
-        draw(stdout, &shown.supervisor, view, &shown.log, several)?;
+        draw(stdout, ui, view)?;
 
         if event::poll(TICK)? {
             match event::read()? {
@@ -192,16 +380,35 @@ fn event_loop(
                     // cell view; inside a picker it would leave a half-made
                     // choice behind, so it is ignored there.
                     if key.code == KeyCode::Tab
-                        && several
+                        && ui.modules.len() > 1
                         && matches!(view, View::List { .. } | View::Cells)
                     {
-                        *selected = (*selected + 1) % modules.len();
+                        ui.selected = (ui.selected + 1) % ui.modules.len();
                         continue;
                     }
 
                     let current = std::mem::replace(view, View::List { cursor: 0 });
-                    let supervisor = &mut modules[*selected].supervisor;
-                    match handle_key(key.code, current, supervisor, config_path) {
+                    let action = match current {
+                        View::List { cursor }
+                            if ROWS[cursor] == Row::Module
+                                && matches!(key.code, KeyCode::Enter | KeyCode::Right) =>
+                        {
+                            Action::Update(ui.open_module_picker())
+                        }
+                        View::PickModule { cursor, error } => {
+                            module_picker_key(key.code, cursor, error, ui)
+                        }
+                        View::ConfirmAdd { slot, notes, error } => {
+                            confirm_add_key(key.code, slot, notes, error, ui)
+                        }
+                        other => handle_key(
+                            key.code,
+                            other,
+                            &mut ui.modules[ui.selected].supervisor,
+                            &ui.config_path,
+                        ),
+                    };
+                    match action {
                         Action::Update(next) => *view = next,
                         Action::Quit => return Ok(()),
                     }
@@ -212,7 +419,7 @@ fn event_loop(
             // No key waiting, so let the modules be looked after - all of them,
             // so the ones not on screen keep publishing too. Every step is
             // bounded, which is what keeps the keyboard responsive.
-            for module in modules.iter_mut() {
+            for module in ui.modules.iter_mut() {
                 module.supervisor.step();
             }
         }
@@ -220,6 +427,78 @@ fn event_loop(
 }
 
 // ── keys ─────────────────────────────────────────────────────────────────────
+
+/// The module picker. Enter on a configured module puts it on screen; on one
+/// that is not configured yet it shows what adding it would change.
+fn module_picker_key(key: KeyCode, mut cursor: usize, error: Option<String>, ui: &mut Ui) -> Action {
+    let back = View::List {
+        cursor: row_index(Row::Module),
+    };
+    let entries = ui.entries();
+    match key {
+        KeyCode::Up => {
+            cursor = cursor.saturating_sub(1);
+            Action::Update(View::PickModule { cursor, error: None })
+        }
+        KeyCode::Down => {
+            if cursor + 1 < entries.len() {
+                cursor += 1;
+            }
+            Action::Update(View::PickModule { cursor, error: None })
+        }
+        KeyCode::Enter => match entries.get(cursor) {
+            Some(ModuleEntry {
+                configured: Some(index),
+                ..
+            }) => {
+                ui.selected = *index;
+                Action::Update(back)
+            }
+            Some(ModuleEntry {
+                slot,
+                configured: None,
+            }) => match preview_add(&ui.config_path, *slot) {
+                Ok(notes) => Action::Update(View::ConfirmAdd {
+                    slot: *slot,
+                    notes,
+                    error: None,
+                }),
+                Err(failure) => Action::Update(View::PickModule {
+                    cursor,
+                    error: Some(failure.to_string()),
+                }),
+            },
+            None => Action::Update(back),
+        },
+        KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => Action::Update(back),
+        _ => Action::Update(View::PickModule { cursor, error }),
+    }
+}
+
+/// The confirmation before a module is added: Enter adds it, Esc goes back to
+/// the picker without having written anything.
+fn confirm_add_key(
+    key: KeyCode,
+    slot: u8,
+    notes: Vec<String>,
+    error: Option<String>,
+    ui: &mut Ui,
+) -> Action {
+    match key {
+        KeyCode::Enter => match ui.add_module(slot) {
+            Ok(()) => Action::Update(View::List {
+                cursor: row_index(Row::Module),
+            }),
+            Err(failure) => Action::Update(View::ConfirmAdd {
+                slot,
+                notes,
+                error: Some(failure.to_string()),
+            }),
+        },
+        KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => Action::Update(ui.open_module_picker()),
+        _ => Action::Update(View::ConfirmAdd { slot, notes, error }),
+    }
+}
 
 fn handle_key(
     key: KeyCode,
@@ -267,16 +546,18 @@ fn handle_key(
                     Action::Update(View::PickMode { row, cursor, error: None })
                 }
                 KeyCode::Enter => match apply_mode(supervisor, config_path, row, choices[cursor]) {
-                    Ok(()) => Action::Update(View::List { cursor: row }),
+                    Ok(()) => Action::Update(View::List {
+                        cursor: row_index(Row::Interface(row)),
+                    }),
                     Err(failure) => Action::Update(View::PickMode {
                         row,
                         cursor,
                         error: Some(failure.to_string()),
                     }),
                 },
-                KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => {
-                    Action::Update(View::List { cursor: row })
-                }
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => Action::Update(View::List {
+                    cursor: row_index(Row::Interface(row)),
+                }),
                 _ => Action::Update(View::PickMode { row, cursor, error }),
             }
         }
@@ -349,11 +630,17 @@ fn handle_key(
             KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
             _ => Action::Update(View::Cells),
         },
+
+        // About every module rather than one; the event loop handles these.
+        view @ (View::PickModule { .. } | View::ConfirmAdd { .. }) => Action::Update(view),
     }
 }
 
 fn open_picker(cursor: usize, supervisor: &Supervisor) -> View {
     match ROWS[cursor] {
+        // The module picker needs every module, not one supervisor; the event
+        // loop opens it before a key gets here.
+        Row::Module => View::List { cursor },
         Row::Interface(index) => {
             let wanted = supervisor
                 .config
@@ -486,13 +773,26 @@ fn apply_supply(
 
 // ── drawing ──────────────────────────────────────────────────────────────────
 
-fn draw(
-    stdout: &mut impl Write,
-    supervisor: &Supervisor,
-    view: &View,
-    log: &Log,
-    several: bool,
-) -> Result<()> {
+fn state_colour(state: State) -> Color {
+    match state {
+        State::Running => Color::Green,
+        State::Failed => Color::Red,
+        _ => Color::DarkGrey,
+    }
+}
+
+fn slots_text(slots: &[u8]) -> String {
+    slots
+        .iter()
+        .map(|slot| slot.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn draw(stdout: &mut impl Write, ui: &Ui, view: &View) -> Result<()> {
+    let shown = ui.current();
+    let supervisor = &shown.supervisor;
+
     queue!(stdout, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
 
     queue!(
@@ -506,23 +806,34 @@ fn draw(
     )?;
     queue!(stdout, Print(SEP))?;
 
-    let state_colour = match supervisor.state {
-        State::Running => Color::Green,
-        State::Failed => Color::Red,
-        _ => Color::DarkGrey,
-    };
+    // The module row: the header, and the first row of the list.
+    let on_module_row = matches!(view, View::List { cursor } if ROWS[*cursor] == Row::Module);
+    caret(stdout, on_module_row)?;
     queue!(
         stdout,
-        Print(format!("  Module: slot {}   ", supervisor.config.slot)),
-        SetForegroundColor(state_colour),
+        Print(format!("Module: slot {}   ", supervisor.config.slot)),
+        SetForegroundColor(state_colour(supervisor.state)),
         Print(supervisor.state.label()),
         ResetColor,
     )?;
-    if several {
+    if ui.modules.len() > 1 {
         queue!(
             stdout,
             SetForegroundColor(Color::DarkGrey),
             Print("   Tab next module"),
+            ResetColor,
+        )?;
+    }
+    let unconfigured = ui.unconfigured();
+    if !unconfigured.is_empty() {
+        let text = match unconfigured.len() {
+            1 => format!("   slot {} not configured", unconfigured[0]),
+            _ => format!("   slots {} not configured", slots_text(&unconfigured)),
+        };
+        queue!(
+            stdout,
+            SetForegroundColor(Color::DarkGrey),
+            Print(text),
             ResetColor,
         )?;
     }
@@ -532,7 +843,13 @@ fn draw(
     match view {
         View::List { cursor } => {
             draw_list(stdout, supervisor, *cursor)?;
-            draw_log(stdout, log)?;
+            draw_log(stdout, &shown.log)?;
+        }
+        View::PickModule { cursor, error } => {
+            draw_module_picker(stdout, ui, *cursor, error.as_deref())?
+        }
+        View::ConfirmAdd { slot, notes, error } => {
+            draw_confirm_add(stdout, ui, *slot, notes, error.as_deref())?
         }
         View::PickMode { row, cursor, error } => {
             draw_mode_picker(stdout, supervisor, *row, *cursor, error.as_deref())?
@@ -611,10 +928,16 @@ fn draw_list(stdout: &mut impl Write, supervisor: &Supervisor, cursor: usize) ->
     };
 
     for (index, row) in ROWS.iter().enumerate() {
+        // Drawn as the header, above the rule line.
+        if *row == Row::Module {
+            continue;
+        }
+
         let selected = index == cursor;
         caret(stdout, selected)?;
 
         match row {
+            Row::Module => {}
             Row::Interface(interface) => {
                 let spec = &INTERFACES[*interface];
                 let mode = wanted.get(*interface).copied().unwrap_or(Mode::Off);
@@ -791,14 +1114,19 @@ fn draw_log(stdout: &mut impl Write, log: &Log) -> Result<()> {
         return Ok(());
     }
 
+    // A long line - an error with its advice - is wrapped rather than left to
+    // the terminal, so it keeps its indent and the screen fits a narrow window.
     queue!(stdout, Print("\r\n"))?;
     for line in lines.iter().rev().take(LOG_SHOWN).rev() {
-        queue!(
-            stdout,
-            SetForegroundColor(Color::DarkGrey),
-            Print(format!("  {line}\r\n")),
-            ResetColor,
-        )?;
+        for (index, part) in wrap(line, LOG_WIDTH).iter().enumerate() {
+            let indent = if index == 0 { "  " } else { "    " };
+            queue!(
+                stdout,
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("{indent}{part}\r\n")),
+                ResetColor,
+            )?;
+        }
     }
     Ok(())
 }
@@ -938,6 +1266,159 @@ fn draw_supply_picker(
         ResetColor,
     )?;
 
+    draw_error(stdout, error)
+}
+
+/// Every Multibus module the UI knows of: the configured ones with their state,
+/// and the ones go-modules found in a slot the configuration lacks.
+fn draw_module_picker(
+    stdout: &mut impl Write,
+    ui: &Ui,
+    cursor: usize,
+    error: Option<&str>,
+) -> Result<()> {
+    queue!(stdout, Print("  Module  \u{2014}  Select Module\r\n\r\n"))?;
+
+    let entries = ui.entries();
+    for (index, entry) in entries.iter().enumerate() {
+        let selected = index == cursor;
+        let label = format!("{:<10}", format!("slot {}", entry.slot));
+        let on_screen = entry.configured == Some(ui.selected);
+
+        caret(stdout, selected)?;
+        if !selected && on_screen {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Green),
+                Print(label),
+                ResetColor
+            )?;
+        } else {
+            queue!(stdout, ResetColor, Print(label))?;
+        }
+
+        match entry.configured {
+            Some(index) => {
+                let supervisor = &ui.modules[index].supervisor;
+                let names = supervisor.names();
+                // The CAN buses are what an application picks, so they are
+                // what tells two modules apart here.
+                let buses = format!("{}..{}", names.can(0), names.can(2).trim_start_matches("mb_can"));
+                queue!(
+                    stdout,
+                    SetForegroundColor(Color::DarkGrey),
+                    Print(format!("{buses:<14}")),
+                    SetForegroundColor(state_colour(supervisor.state)),
+                    Print(supervisor.state.label()),
+                    ResetColor,
+                )?;
+            }
+            None => queue!(
+                stdout,
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("{:<14}not configured - Enter adds it", "-")),
+                ResetColor,
+            )?,
+        }
+        queue!(stdout, ResetColor, Print("\r\n"))?;
+    }
+
+    hint(
+        stdout,
+        "\u{2191}/\u{2193} navigate   Enter select   \u{2190}/Esc back",
+    )?;
+
+    queue!(stdout, Print("\r\n"), SetForegroundColor(Color::DarkGrey))?;
+    if entries.len() > 1 {
+        queue!(
+            stdout,
+            Print("  The modules in the configuration, and every Multibus module go-modules\r\n"),
+            Print("  found in a slot that is not configured yet.\r\n"),
+        )?;
+    } else {
+        queue!(
+            stdout,
+            Print("  go-modules found no other Multibus module. A module plugged in since the\r\n"),
+            Print("  last scan shows up here after: go-modules scan\r\n"),
+        )?;
+    }
+    queue!(stdout, ResetColor)?;
+
+    draw_error(stdout, error)
+}
+
+/// How wide a note on the confirmation screen may run, indent not counted.
+const NOTE_WIDTH: usize = 72;
+
+/// The same for a log line under the list.
+const LOG_WIDTH: usize = 74;
+
+/// Break `text` into lines of at most `width` characters, at spaces. A word
+/// longer than that - a path - gets a line of its own rather than being cut.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// What adding a module changes, before anything is written.
+fn draw_confirm_add(
+    stdout: &mut impl Write,
+    ui: &Ui,
+    slot: u8,
+    notes: &[String],
+    error: Option<&str>,
+) -> Result<()> {
+    queue!(
+        stdout,
+        Print(format!("  Module  \u{2014}  Add slot {slot}\r\n\r\n")),
+        Print(format!(
+            "  Adds slot {slot} to {}, every setting at its default:\r\n",
+            ui.config_path
+        )),
+    )?;
+    // Wrapped here rather than by the terminal, so a continuation keeps the
+    // indent and the screen fits an 80 column window.
+    for note in notes {
+        for (index, line) in wrap(note, NOTE_WIDTH).iter().enumerate() {
+            let indent = if index == 0 { "    " } else { "      " };
+            queue!(
+                stdout,
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("{indent}{line}\r\n")),
+                ResetColor,
+            )?;
+        }
+    }
+
+    // The modules that are there keep their names and keep running; only the
+    // new one is reset.
+    let others = ui.configured_slots();
+    let resets = match others.len() {
+        1 => format!(
+            "  Then the module in slot {slot} is reset and brought up. Slot {} keeps running.\r\n",
+            others[0]
+        ),
+        _ => format!(
+            "  Then the module in slot {slot} is reset and brought up. Slots {} keep running.\r\n",
+            slots_text(&others)
+        ),
+    };
+    queue!(stdout, Print("\r\n"), Print(resets))?;
+
+    hint(stdout, "Enter add and reset   \u{2190}/Esc back")?;
     draw_error(stdout, error)
 }
 
@@ -1172,6 +1653,50 @@ mod tests {
         assert_eq!(row_index(Row::Interface(4)) + 1, row_index(Row::Role));
         assert_eq!(row_index(Row::Role) + 1, row_index(Row::Supply));
         assert_eq!(row_index(Row::Supply), ROWS.len() - 1);
+    }
+
+    #[test]
+    fn a_note_is_wrapped_at_spaces_and_never_cut() {
+        let lines = wrap("slot 8 is now named mb8_can1..3 and publishes to /a/long/path", 20);
+        assert_eq!(
+            lines,
+            vec!["slot 8 is now named", "mb8_can1..3 and", "publishes to", "/a/long/path"]
+        );
+        assert!(lines.iter().all(|line| line.len() <= 20));
+        assert_eq!(wrap("", 20), Vec::<String>::new());
+        assert_eq!(wrap("averyveryverylongword", 5), vec!["averyveryverylongword"]);
+    }
+
+    #[test]
+    fn the_module_row_comes_before_the_interfaces() {
+        assert_eq!(row_index(Row::Module), 0);
+        assert_eq!(row_index(Row::Interface(0)), 1);
+    }
+
+    #[test]
+    fn the_picker_lists_configured_and_found_modules_once_each() {
+        let entries = module_entries(&[8], &[7, 8]);
+        assert_eq!(
+            entries,
+            vec![
+                ModuleEntry {
+                    slot: 7,
+                    configured: None
+                },
+                ModuleEntry {
+                    slot: 8,
+                    configured: Some(0)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_configured_module_go_modules_did_not_find_is_still_listed() {
+        let entries = module_entries(&[3, 8], &[]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].configured, Some(0));
+        assert_eq!(entries[1].configured, Some(1));
     }
 
     #[test]

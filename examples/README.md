@@ -1,5 +1,34 @@
 # Examples
 
+## Sending and receiving: RS232, RS485 and isoSPI
+
+Three short Python 3 scripts that run straight on the controller, with nothing
+to install. Copy one over and run it:
+
+```sh
+python3 rs485_send_receive.py /dev/mb_serial2 115200
+```
+
+| Script | Interface | Default port | What it does |
+|--------|-----------|--------------|--------------|
+| [rs232_send_receive.py](rs232_send_receive.py) | RS232, connector interface 2 | `/dev/mb_serial1` | sends one line, then prints whatever arrives |
+| [rs485_send_receive.py](rs485_send_receive.py) | RS485, connector interface 2, 3 or 4 | `/dev/mb_serial2` | sends a request once a second and prints the answer |
+| [isospi_transfer.py](isospi_transfer.py) | isoSPI, connector interface 5 | `/dev/mb_protocol` | clocks bytes out over the isoSPI link and prints the bytes clocked back |
+
+The port and the baud rate are the first two arguments; a second Multibus
+Module is `/dev/mb_serial4..6` and `/dev/mb_protocol2`. The interface has to be
+in the right mode first - in the `go-multibus` UI, or with `go-multibus set`.
+
+- **RS232 and RS485** are ordinary serial ports. The baud rate is set like on
+  any other port, and the module applies it, with the parity and stop bits, to
+  its UART. On RS485 the module switches the transceiver between transmit and
+  receive by itself, so a script only writes and reads.
+- **isoSPI** goes through the module protocol on the protocol port
+  ([../docs/multibus-usb-protocol.md](../docs/multibus-usb-protocol.md),
+  command `ISOSPI_XFER`). The service holds that port, so stop it first with
+  `systemctl stop go-multibus`, and start it again afterwards. Only a module in
+  the isoSPI master role can clock a transfer.
+
 ## node-red-multibus-cells.json
 
 Reads the cell voltages the `go-multibus` service publishes and hands them on as

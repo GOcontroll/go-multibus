@@ -31,7 +31,7 @@ go-multibus set 3 can                    # change one interface, store it
 go-multibus supply 9V                    # external supply: store and apply
 go-multibus supply off
 go-multibus role slave                   # isoSPI role: store and apply
-go-multibus module add 7                 # configure a second module
+go-multibus module add 7                 # configure a second module (or in the UI)
 go-multibus module remove 7
 go-multibus ports                        # modules, ports and CAN interfaces
 
@@ -65,6 +65,16 @@ when several are present.
 Only one of `go-multibus daemon` and the UI can run at a time: both open the
 module's protocol port, and two processes on one CDC port read each other's
 answers. The UI refuses to start while the service is active and says so.
+
+The UI's first row is the module the list is about. Enter on it opens the
+module picker: every configured module with its CAN buses and state, and every
+Multibus module go-modules found in a slot that is not configured yet. Enter on
+such a module shows what adding it changes, and Enter again adds it and brings
+it up - the modules already there keep running. Tab moves between configured
+modules.
+
+Ready-made scripts to send and receive on an RS232 port, an RS485 port and the
+isoSPI link are in [examples/](examples/).
 
 ## The bring-up sequence
 
@@ -180,34 +190,43 @@ anything else on the controller that refers to a name needs it.
 
 ### More than one module
 
-Two modules would both claim `mb_can1`, so with more than one module configured
-every name carries the slot instead:
+Every module has a **number** in the configuration, and the numbering of the
+names carries on from one module to the next:
 
-| Slot 7              | Slot 8              |
-|---------------------|---------------------|
-| `mb7_can1..3`       | `mb8_can1..3`       |
-| `/dev/mb7_serial1..3` | `/dev/mb8_serial1..3` |
-| `/dev/mb7_protocol` | `/dev/mb8_protocol` |
+| Module 1              | Module 2              |
+|-----------------------|-----------------------|
+| `mb_can1..3`          | `mb_can4..6`          |
+| `/dev/mb_serial1..3`  | `/dev/mb_serial4..6`  |
+| `/dev/mb_protocol`    | `/dev/mb_protocol2`   |
 
-Nothing in a uevent says which slot a USB device sits in - both modules have
-the same ids and the same interfaces. What tells them apart is the USB serial
-number, and the module bus, which does reach one particular slot, is where the
-service asks for it (firmware 0.3.0). It writes the answer down, one line per
-module:
+Module 1 has the names a single module always had. The scheme is the one the
+GOcontroll Simulink blockset uses: its *Multibus CAN 1..3* are `mb_can1..3`, and
+a second module is planned there as `mb_can4..6`. A name with the slot in it, as
+0.3.0 to 0.3.2 gave a second module (`mb7_can1`), it cannot choose at all.
+**A module keeps its number when another one is added**, so the module that was there first stays
+`mb_can1..3` and an application built for it keeps working; the new one becomes
+module 2, whichever slot it sits in. `module add`, and adding a module in the
+UI, hand out the lowest free number and write it in the file.
+
+Nothing in a uevent says which module a USB device is - both have the same ids
+and the same interfaces. What tells them apart is the USB serial number, and the
+module bus, which does reach one particular slot, is where the service asks for
+it (firmware 0.3.0). It writes the answer down, one line per module: serial,
+module number, slot.
 
 ```
-206435A63245 mb7_
-2064359B3245 mb8_
+3671394B3435 1 8
+366039703435 2 7
 ```
 
 in `/run/gocontroll/multibus-usb-names`, with a copy in
 `/var/lib/go-multibus/usb-names` that survives a reboot. The udev helper looks
-every device's serial number up there and puts the prefix in front of the name.
+every device's serial number up there and names it after the module number.
 A device udev reached before the line was written is named again by the service
 once it is, while its CAN interfaces are still down.
 
 One module - a plain configuration, or a module list with one entry - has no map
-and keeps the `mb_` names, so nothing about a single-module controller changes.
+and is module 1, so nothing about a single-module controller changes.
 
 ## Config file
 
@@ -231,22 +250,24 @@ One module, the form every release has read:
 ```
 
 More than one module, as a list. Every entry takes the same keys as the
-one-module form plus `isospi_role`, and only `slot` is required; the rest
-default as above. `publish_interval_s` stays at the top.
+one-module form plus `number` and `isospi_role`, and only `slot` is required;
+the rest default as above. `publish_interval_s` stays at the top.
 
 ```json
 {
   "publish_interval_s": 0.5,
   "modules": [
-    { "slot": 7, "isospi_role": "slave", "interfaces": ["can", "rs485", "can", "rs485", "isospi"] },
-    { "slot": 8, "isospi_role": "master", "supply_enabled": true, "supply_mv": 9000 }
+    { "slot": 7, "number": 2, "isospi_role": "slave", "interfaces": ["can", "rs485", "can", "rs485", "isospi"] },
+    { "slot": 8, "number": 1, "isospi_role": "master", "supply_enabled": true, "supply_mv": 9000 }
   ]
 }
 ```
 
-Slots must be 1..8 and different. `go-multibus module add 7` turns a one-module
-file into a list and `module remove` takes an entry out again; a list with one
-entry behaves exactly like the one-module form.
+Slots must be 1..8 and different, and so must the numbers. An entry without a
+`number` gets the lowest one still free, in file order. `go-multibus module add
+7` turns a one-module file into a list - the module that was there becomes
+module 1 - and `module remove` takes an entry out again; a list with one entry
+behaves exactly like the one-module form, and its module is module 1 again.
 
 `interfaces` is indexed by **connector interface**, so `interfaces[2]` is
 interface 3 and drives `mb_can2`.
